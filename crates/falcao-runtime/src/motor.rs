@@ -60,6 +60,9 @@ pub struct Motor {
     /// Olhado a cada 65.536 voltas de laço: `Some(motivo)` interrompe o script com um Error
     /// (prazo, botão Parar). Quem embute decide; uma vez interrompido, a olhada continua dizendo sim.
     pub interromper: Option<Box<dyn FnMut() -> Option<String>>>,
+    /// O último erro que o próprio motor criou e a profundidade da pilha naquela hora: o
+    /// intérprete refaz a pilha dele já com a instrução certa ([`Motor::reanotar_erro`]).
+    pub erro_interno: (Valor, u32),
     pub voltas: u32,
     /// Dados de quem embute o motor (o navegador guarda a página aqui), lidos pelas nativas dele.
     pub hospede: Option<Box<dyn std::any::Any>>,
@@ -135,6 +138,7 @@ impl Motor {
             aninhamento: 0,
             ao_imprimir: None,
             interromper: None,
+            erro_interno: (Valor::UNDEFINED, 0),
             voltas: 0,
             hospede: None,
             rejeicoes: Vec::new(),

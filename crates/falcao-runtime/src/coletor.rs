@@ -239,6 +239,8 @@ impl Motor {
 
     /// Coleta agora. `extra`: valores do chamador que também são raízes (e são atualizados).
     pub fn coletar(&mut self, extra: &mut [Valor]) {
+        // Os endereços mudam: o erro guardado para refazer a pilha não vale mais.
+        self.erro_interno = (Valor::UNDEFINED, 0);
         debug_assert_eq!(self.aninhamento, 0, "coleta fora de ponto seguro");
         self.coleta_menor(extra);
         self.coletas[0] += 1;

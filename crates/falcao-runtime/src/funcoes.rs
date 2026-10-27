@@ -81,6 +81,8 @@ pub struct Proto {
     pub chamadas: u32,
     /// Fonte do script (para `Function.prototype.toString`).
     pub fonte: Option<Rc<str>>,
+    /// Nome da fonte na pilha dos erros (`macro`, `api`, a URL do script…).
+    pub origem: Option<Rc<str>>,
     /// Módulo dono (índice em `Motor::modulos`; `u32::MAX` = script comum).
     pub modulo: u32,
 }
@@ -154,7 +156,7 @@ impl Motor {
                 None => Valor::VAZIA,
             };
             let caches = vec![CacheProp::default(); fb.caches as usize];
-            self.protos.push(Proto { script: script.clone(), indice: i, consts, caches, nome, chamadas: 0, fonte: None, modulo: u32::MAX });
+            self.protos.push(Proto { script: script.clone(), indice: i, consts, caches, nome, chamadas: 0, fonte: None, origem: None, modulo: u32::MAX });
         }
         base
     }

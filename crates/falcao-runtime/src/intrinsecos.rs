@@ -280,6 +280,7 @@ impl Motor {
         }
         let pilha = self.texto_da_pilha();
         self.definir_propria(e, fixos::STACK, pilha, attr::METODO);
+        self.erro_interno = (e, self.quadros.len() as u32);
         e
     }
 

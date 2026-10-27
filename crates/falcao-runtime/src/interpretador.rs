@@ -197,11 +197,37 @@ impl Motor {
         for q in self.quadros.iter().rev().take(10) {
             let p = &self.protos[q.proto as usize];
             let fb = p.codigo();
-            let pos = fb.posicao_de(q.pc.saturating_sub(1));
+            let pos = fb.posicao_de(q.pc.saturating_sub(1)) as usize;
             let nome = fb.nome.map(|t| String::from_utf16_lossy(&p.script.textos[t as usize])).unwrap_or_else(|| "<anônima>".into());
-            s.push_str(&format!("\n    at {nome} (:{pos})"));
+            let origem = p.origem.as_deref().unwrap_or("");
+            // Linha e coluna (a partir de 1) no texto do script, como nos outros motores.
+            let local = match p.fonte.as_deref().and_then(|f| f.get(..pos.min(f.len()))) {
+                Some(antes) => {
+                    let linha = antes.matches('\n').count() + 1;
+                    let coluna = antes.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+                    format!("{origem}:{linha}:{coluna}")
+                }
+                None => format!("{origem}:{pos}"),
+            };
+            s.push_str(&format!("\n    at {nome} ({local})"));
         }
         self.texto(&s)
+    }
+
+    /// Erro criado pelo motor no meio de uma instrução (`null.a`, `x is not a function`): a
+    /// pilha foi montada com o quadro ainda marcado na última chamada, e a linha saía errada.
+    /// Refaz com a instrução `ini`, se o erro é desta função. Só roda quando há erro.
+    #[cold]
+    fn reanotar_erro(&mut self, e: Valor, qi: usize, ini: usize) {
+        let (ultimo, profundidade) = std::mem::replace(&mut self.erro_interno, (Valor::UNDEFINED, 0));
+        if ultimo != e || profundidade as usize != self.quadros.len() || !self.e_objeto(e) {
+            return;
+        }
+        let salvo = self.quadros[qi].pc;
+        self.quadros[qi].pc = ini as u32 + 1;
+        let pilha = self.texto_da_pilha();
+        self.quadros[qi].pc = salvo;
+        self.definir_propria(e, crate::nomes::fixos::STACK, pilha, crate::formas::attr::METODO);
     }
 
     // ---------------------------------------------------------------- entrar em funções
@@ -505,6 +531,17 @@ impl Motor {
         self.executar(proto)
     }
 
+    /// Como [`Self::avaliar`], com o nome da fonte que aparece na pilha dos erros
+    /// (`at f (origem:linha:coluna)`).
+    pub fn avaliar_com_nome(&mut self, fonte: &str, origem: &str) -> Res<Valor> {
+        let proto = self.compilar_script(fonte)?;
+        let origem: Rc<str> = Rc::from(origem);
+        for p in &mut self.protos[proto as usize..] {
+            p.origem = Some(Rc::clone(&origem));
+        }
+        self.executar(proto)
+    }
+
     /// Texto vindo do JS (`eval`, `new Function`): o embutidor pode recusar (CSP).
     pub(crate) fn compilar_texto(&mut self, fonte: &str) -> Res<u32> {
         if let Some(f) = self.ao_compilar_texto {
@@ -524,7 +561,14 @@ impl Motor {
                     Err(e) => return Err(self.erro(crate::intrinsecos::TipoErro::Sintaxe, &e.mensagem)),
                 }
             }
-            Err(e) => return Err(self.erro(crate::intrinsecos::TipoErro::Sintaxe, &e.mensagem)),
+            Err(e) => {
+                // Onde está o erro, como na pilha: linha e coluna a partir de 1.
+                let antes = fonte.get(..(e.posicao as usize).min(fonte.len())).unwrap_or("");
+                let linha = antes.matches('\n').count() + 1;
+                let coluna = antes.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+                let msg = format!("{} (linha {linha}, coluna {coluna})", e.mensagem);
+                return Err(self.erro(crate::intrinsecos::TipoErro::Sintaxe, &msg));
+            }
         };
         let base = self.carregar(script);
         let fonte: Rc<str> = Rc::from(fonte);
@@ -742,6 +786,7 @@ impl Motor {
                             Ok(x) => x,
                             Err(e) => {
                                 self.quadros[qi].pc = ini as u32;
+                                self.reanotar_erro(e, qi, ini);
                                 break 'exec e;
                             }
                         }
@@ -2124,5 +2169,30 @@ mod testes_compilar_texto {
             )
             .unwrap_or_else(|e| panic!("{}", m.texto_do_erro(e)));
         assert_eq!(m.para_texto_rust(v).unwrap(), "a|a|b|b|c|d|e|1,2,3,7,07,4294967295,x|2");
+    }
+}
+
+#[cfg(test)]
+mod testes_pilha {
+    use crate::Motor;
+
+    /// A pilha dos erros diz a fonte, a linha e a coluna (a partir de 1) de cada quadro.
+    #[test]
+    fn pilha_tem_origem_linha_e_coluna() {
+        let mut m = Motor::novo();
+        let e = m.avaliar_com_nome("log = 1;\nfunction g() {\n  throw new Error('x');\n}\ng();", "macro").unwrap_err();
+        let t = m.texto_do_erro(e);
+        assert!(t.contains("at g (macro:3:"), "{t}");
+        assert!(t.contains("(macro:5:"), "{t}");
+        let e = m.avaliar("\n\nthrow new Error('y');").unwrap_err();
+        let t = m.texto_do_erro(e);
+        assert!(t.contains("(:3:"), "sem nome, só a linha e a coluna: {t}");
+        // Erro do próprio motor no meio de uma função: a linha é a da instrução, não a da entrada.
+        let e = m.avaliar_com_nome("function f(o) {\n  let x = 1;\n  return o.a;\n}\nf(null);", "macro").unwrap_err();
+        let t = m.texto_do_erro(e);
+        assert!(t.contains("at f (macro:3:"), "{t}");
+        let e = m.avaliar("let a = 1;\nlet b = ;").unwrap_err();
+        let t = m.texto_do_erro(e);
+        assert!(t.contains("(linha 2, coluna 9)"), "{t}");
     }
 }
