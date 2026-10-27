@@ -1,0 +1,13 @@
+[package]
+name = "falcao-runtime"
+description = "Valores, gaiola, formas, objetos, coletor e intérprete do motor JavaScript Falcão"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+falcao-sintaxe = { path = "../falcao-sintaxe" }
+falcao-bytecode = { path = "../falcao-bytecode" }

@@ -1,0 +1,12 @@
+[package]
+name = "falcao-bytecode"
+description = "Gerador de bytecode do motor JavaScript Falcão (árvore + escopos → bytecode)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+falcao-sintaxe = { path = "../falcao-sintaxe" }
