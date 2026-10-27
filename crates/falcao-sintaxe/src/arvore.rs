@@ -135,6 +135,8 @@ pub enum No {
     Membro { obj: NoId, prop: Atomo, opcional: bool },
     Indice { obj: NoId, prop: NoId, opcional: bool },
     MembroPrivado { obj: NoId, prop: Atomo, opcional: bool },
+    /// `#x` sozinho, no lado esquerdo de `#x in obj`.
+    NomePrivado(Atomo),
     Chamada { func: NoId, args: Lista, opcional: bool },
     New { func: NoId, args: Lista },
     /// Fronteira de uma cadeia com `?.`: se algum `?.` dentro der `null`/`undefined`, tudo é `undefined`.

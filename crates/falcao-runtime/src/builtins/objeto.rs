@@ -54,6 +54,7 @@ pub(super) fn instalar(m: &mut Motor) {
     m.metodo(op, "__defineGetter__", 2, define_getter);
     m.metodo(op, "__defineSetter__", 2, define_setter);
     m.metodo(op, "__lookupGetter__", 1, lookup_getter);
+    m.metodo(op, "__lookupSetter__", 1, lookup_setter);
     let pg = m.nativa("get __proto__", 0, proto_get, false);
     let ps = m.nativa("set __proto__", 1, proto_set, false);
     m.definir_acessor(op, ChaveProp::Nome(fixos::PROTO), pg, false, false);
@@ -404,7 +405,7 @@ fn is_extensible(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor>
 
 fn from_entries(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     let o = m.objeto_vazio();
-    for par in m.coletar_iteravel(m.arg(a, 0))? {
+    m.percorrer_iteravel(m.arg(a, 0), |m, par, _| {
         if !m.e_objeto(par) {
             return m.erro_tipo("Iterator value is not an entry object");
         }
@@ -412,7 +413,8 @@ fn from_entries(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> 
         let v = m.obter(par, ChaveProp::Indice(1))?;
         let k = m.para_chave(k)?;
         m.criar_dado(o, k, v)?;
-    }
+        Ok(())
+    })?;
     Ok(o)
 }
 
@@ -499,11 +501,17 @@ fn has_own(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
 }
 
 fn group_by(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
-    let f = m.arg(a, 1);
-    let itens = m.coletar_iteravel(m.arg(a, 0))?;
+    let (itens, f) = (m.arg(a, 0), m.arg(a, 1));
+    if itens.e_nulo_ou_indefinido() {
+        return m.erro_tipo("Object.groupBy called on null or undefined");
+    }
+    if !m.e_funcao(f) {
+        let d = m.descrever(f);
+        return m.erro_tipo(&format!("{d} is not a function"));
+    }
     let r = m.forma_para(Classe::Comum, Valor::NULL, 4);
     let r = m.novo_objeto(r);
-    for (i, v) in itens.into_iter().enumerate() {
+    m.percorrer_iteravel(itens, |m, v, i| {
         let iv = m.numero(i as f64);
         let k = m.chamar(f, Valor::UNDEFINED, &[v, iv])?;
         let k = m.para_chave(k)?;
@@ -514,7 +522,8 @@ fn group_by(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
         }
         let n = m.array_len(grupo);
         m.gravar_elemento(grupo, n, v);
-    }
+        Ok(())
+    })?;
     Ok(r)
 }
 
@@ -548,7 +557,7 @@ fn property_is_enumerable(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Re
 
 fn to_locale_string(m: &mut Motor, this: Valor, _a: Args, _nt: Valor) -> Res<Valor> {
     let f = m.obter(this, ChaveProp::Nome(fixos::TO_STRING))?;
-    m.chamar(f, this, &[])
+    m.chamar_coletavel(f, this, &[])
 }
 
 fn value_of(m: &mut Motor, this: Valor, _a: Args, _nt: Valor) -> Res<Valor> {
@@ -578,11 +587,26 @@ fn define_setter(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> 
 }
 
 fn lookup_getter(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    lookup_acessor(m, this, a, false)
+}
+
+fn lookup_setter(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    lookup_acessor(m, this, a, true)
+}
+
+/// `__lookupGetter__` (`setter` falso) e `__lookupSetter__` (verdadeiro), Anexo B.
+fn lookup_acessor(m: &mut Motor, this: Valor, a: Args, setter: bool) -> Res<Valor> {
     let mut o = m.para_objeto(this)?;
     let k = m.para_chave(m.arg(a, 0))?;
     while o != Valor::NULL {
         if let Some(d) = m.descritor_proprio(o, k) {
-            return Ok(if d.acessor() { d.get } else { Valor::UNDEFINED });
+            return Ok(if !d.acessor() {
+                Valor::UNDEFINED
+            } else if setter {
+                d.set
+            } else {
+                d.get
+            });
         }
         o = m.proto_de(o);
     }
@@ -621,8 +645,12 @@ fn call(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     }
     let t = m.arg(a, 0);
     let resto: Vec<Valor> = (1..a.n.max(1)).map(|i| m.arg(a, i)).collect();
-    m.chamar(this, t, &resto)
+    m.chamar_coletavel(this, t, &resto)
 }
+
+/// Argumentos numa chamada por lista (`apply`, `Reflect.apply/construct`). shortcut: teto fixo,
+/// perto do do SpiderMonkey (500 mil); sobe se aparecer uso legítimo maior.
+pub(crate) const LIMITE_ARGS: u64 = 1 << 20;
 
 /// CreateListFromArrayLike.
 pub(crate) fn lista_de_array(m: &mut Motor, v: Valor) -> Res<Vec<Valor>> {
@@ -633,7 +661,11 @@ pub(crate) fn lista_de_array(m: &mut Motor, v: Valor) -> Res<Vec<Valor>> {
         return m.erro_tipo("CreateListFromArrayLike called on non-object");
     }
     let n = m.comprimento_de(v)?;
-    let mut r = Vec::with_capacity(n.min(1 << 20) as usize);
+    // Uma lista de argumentos sem teto (`f.apply(null, {length: 2**32})`) leva gigabytes.
+    if n > LIMITE_ARGS {
+        return m.erro_alcance("Too many arguments in function call");
+    }
+    let mut r = Vec::with_capacity(n as usize);
     for i in 0..n {
         r.push(m.obter_indice(v, i)?);
     }
@@ -646,7 +678,7 @@ fn apply(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     }
     let t = m.arg(a, 0);
     let args = lista_de_array(m, m.arg(a, 1))?;
-    m.chamar(this, t, &args)
+    m.chamar_coletavel(this, t, &args)
 }
 
 fn bind(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
@@ -681,7 +713,7 @@ fn bind(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     let nome = m.obter(this, ChaveProp::Nome(fixos::NAME))?;
     let nome = if m.e_texto(nome) { nome } else { Valor::VAZIA };
     let pre = m.texto("bound ");
-    let nome = m.concatenar(pre, nome);
+    let nome = m.concatenar(pre, nome)?;
     m.definir_propria(b, fixos::NAME, nome, attr::CONFIGURAVEL);
     Ok(b)
 }
@@ -779,7 +811,7 @@ fn reflect_apply(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor>
         return m.erro_tipo("Reflect.apply target is not a function");
     }
     let args = lista_de_array(m, m.arg(a, 2))?;
-    m.chamar(f, t, &args)
+    m.chamar_coletavel(f, t, &args)
 }
 
 fn reflect_construct(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {

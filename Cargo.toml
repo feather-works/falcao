@@ -4,6 +4,7 @@ members = [
     "crates/falcao-sintaxe",
     "crates/falcao-bytecode",
     "crates/falcao-runtime",
+    "crates/falcao-asm",
 ]
 
 [workspace.package]

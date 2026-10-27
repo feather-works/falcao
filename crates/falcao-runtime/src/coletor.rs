@@ -10,11 +10,13 @@
 //! - WeakMap/WeakSet são efêmeros na maior: o valor só vive se a chave vive, e a entrada com
 //!   chave morta sai. Tabelas de Map/Set mortos são liberadas.
 //!
-//! Só roda em ponto seguro (`aninhamento == 0`): nenhum `Valor` solto no Rust além das raízes.
+//! Só roda em ponto seguro ([`Motor::pode_coletar`]): nenhum `Valor` solto no Rust além das
+//! raízes. Os callbacks de `forEach`/`map`/`filter`/`some`/`every` coletam
+//! ([`Motor::chamar_coletavel`]).
 //!
-//! shortcut: JS chamado de dentro de nativa (eval, `new Function`, `importScripts`, callback de
-//! `forEach`/`map`, async antes do 1º await) não coleta até a nativa voltar; upgrade: raízes
-//! para os `Valor` que as nativas e os tratadores de chamada seguram durante a chamada.
+//! shortcut: o resto do JS chamado de dentro de nativa (eval, `new Function`, `importScripts`,
+//! getters, `reduce`, `sort`, async antes do 1º await) não coleta até a nativa voltar; upgrade:
+//! passar a nativa para `chamar_coletavel`, com o que ela usa depois da chamada em `raizes`.
 //!
 //! shortcut: formas nunca morrem e o protótipo delas é raiz; o mesmo vale para os quadros de
 //! geradores largados no meio (`suspensos`) e para o alvo de WeakRef (propriedade comum); a
@@ -112,6 +114,8 @@ fn raizes(m: &mut Motor, extra: &mut [Valor], f: &mut dyn FnMut(&mut Gaiola, &Fo
         pilha,
         quadros,
         protos,
+        poli,
+        mega,
         intr,
         lexico_valores,
         chamado,
@@ -164,12 +168,17 @@ fn raizes(m: &mut Motor, extra: &mut [Valor], f: &mut dyn FnMut(&mut Gaiola, &Fo
             v(&mut c.dono);
         }
     }
+    poli.iter_mut().flatten().for_each(|c| v(&mut c.dono));
+    mega.values_mut().for_each(|c| v(&mut c.dono));
     let i = intr;
     [
         &mut i.global, &mut i.objeto_proto, &mut i.funcao_proto, &mut i.array_proto, &mut i.texto_proto,
         &mut i.numero_proto, &mut i.booleano_proto, &mut i.simbolo_proto, &mut i.bigint_proto,
-        &mut i.iterador_proto, &mut i.array_buffer_proto, &mut i.array_iterador_proto,
+        &mut i.iterador_proto, &mut i.iterador_helper_proto, &mut i.wrap_iterador_proto,
+        &mut i.array_buffer_proto, &mut i.shared_array_buffer_proto, &mut i.atomics_esperas, &mut i.array_iterador_proto,
         &mut i.gerador_funcao_proto, &mut i.gerador_proto, &mut i.promessa_proto, &mut i.regex_proto,
+        &mut i.async_funcao_proto, &mut i.async_gerador_funcao_proto, &mut i.async_gerador_proto,
+        &mut i.async_iterador_proto, &mut i.async_de_sync_proto, &mut i.promessa_ctor, &mut i.promessa_js,
         &mut i.regex_exec, &mut i.eval, &mut i.array_valores, &mut i.array_iterador_next,
         &mut i.funcao_has_instance,
     ]
@@ -177,6 +186,7 @@ fn raizes(m: &mut Motor, extra: &mut [Valor], f: &mut dyn FnMut(&mut Gaiola, &Fo
     .for_each(&mut v);
     i.erro_protos.iter_mut().for_each(&mut v);
     i.tipados_protos.iter_mut().for_each(&mut v);
+    i.tipados_ctors.iter_mut().for_each(&mut v);
 }
 
 /// Passa `mudar` nos protótipos das formas e refaz o índice de raízes delas.
@@ -232,16 +242,22 @@ impl Motor {
     /// Coleta se o berçário encheu e nada do Rust segura valores (o embutidor chama entre
     /// tarefas; o intérprete chama nos pontos seguros dele).
     pub fn coletar_se_preciso(&mut self) {
-        if self.aninhamento == 0 && self.g.coleta_pendente {
+        if self.pode_coletar() && self.g.coleta_pendente {
             self.coletar(&mut []);
         }
+    }
+
+    /// Todo nível de nativa aberto é seguro: nenhum `Valor` solto no Rust.
+    #[inline]
+    pub fn pode_coletar(&self) -> bool {
+        self.aninhamento == self.seguro
     }
 
     /// Coleta agora. `extra`: valores do chamador que também são raízes (e são atualizados).
     pub fn coletar(&mut self, extra: &mut [Valor]) {
         // Os endereços mudam: o erro guardado para refazer a pilha não vale mais.
         self.erro_interno = (Valor::UNDEFINED, 0);
-        debug_assert_eq!(self.aninhamento, 0, "coleta fora de ponto seguro");
+        debug_assert!(self.pode_coletar(), "coleta fora de ponto seguro");
         self.coleta_menor(extra);
         self.coletas[0] += 1;
         let limite = MAIOR_MIN.max(self.vivo_apos_maior);
@@ -249,6 +265,18 @@ impl Motor {
             self.coleta_maior(extra);
             self.coletas[1] += 1;
         }
+        self.g.gatilho_velho = MAIOR_MIN.max(self.vivo_apos_maior);
+        self.g.coleta_pendente = self.estresse;
+    }
+
+    /// Menor e maior agora, sem olhar os limites (a gaiola passou do teto).
+    pub(crate) fn coletar_tudo(&mut self, extra: &mut [Valor]) {
+        self.erro_interno = (Valor::UNDEFINED, 0);
+        self.coleta_menor(extra);
+        self.coleta_maior(extra);
+        self.coletas[0] += 1;
+        self.coletas[1] += 1;
+        self.g.gatilho_velho = MAIOR_MIN.max(self.vivo_apos_maior);
         self.g.coleta_pendente = self.estresse;
     }
 
@@ -550,6 +578,35 @@ mod testes {
         );
         assert_eq!(r, format!("{}:20000", (0..20000u64).sum::<u64>()));
         assert!(m.coletas[0] > 100 && m.coletas[1] > 10, "{:?}", m.coletas);
+    }
+
+    /// Coleta dentro dos callbacks de forEach/map/filter/some/every: o array, o callback, o
+    /// resultado em montagem e o item continuam certos depois de mudarem de endereço.
+    #[test]
+    fn coleta_dentro_de_callback() {
+        let mut m = estressado();
+        let r = rodar(&mut m, "[1].forEach(function () { for (let i = 0; i < 1000; i++) { let lixo = [i, {i}]; } }); 'ok'");
+        assert_eq!(r, "ok");
+        assert!(m.coletas[0] > 500, "o callback não coletou: {:?}", m.coletas);
+        let r = rodar(
+            &mut m,
+            "const d = Array.from({length: 300}, (_, i) => ({id: i, nome: 'item' + i}));
+             let soma = 0;
+             d.forEach((x, i, arr) => { const l = {a: [x.id]}; soma += l.a[0]; if (arr !== d) throw new Error('arr'); });
+             const m = d.map(x => ({dobro: x.id * 2, txt: x.nome + '!'}));
+             const f = d.filter((x, i) => [i, {i}][1].i % 3 === 0);
+             const s = d.some(x => ({x}).x.id === 299), e = d.every(x => [x][0].nome === 'item' + x.id);
+             const dentro = [1, 2].map(k => d.map(x => ({v: x.id + k})).filter(o => o.v % 100 === 0).length);
+             const red = d.reduce((ac, x) => ({t: ac.t + [x.id][0]}), {t: 0}).t;
+             const mapa = new Map(d.map(x => [x.id, {x}])), conj = new Set(d);
+             let pm = 0, pc = 0;
+             mapa.forEach((v, k, mm) => { pm += v.x.id + ({k}).k; if (mm !== mapa) throw new Error('mapa'); });
+             conj.forEach(x => { pc += [x][0].id; });
+             const via = (function (a, b) { return [this.k, a.v, b.v].join('/'); }).call({k: 'c'}, {v: 1}, {v: 2})
+               + (function (a) { return [{a}][0].a; }).apply(null, ['ap']) + Reflect.apply(x => ({x}).x, null, ['rf']);
+             [soma, m[299].dobro, m[123].txt, f.length, f[99].id, s, e, dentro, red, pm, pc, via].join()",
+        );
+        assert_eq!(r, "44850,598,item123!,100,297,true,true,3,3,44850,89700,44850,c/1/2aprf");
     }
 
     #[test]

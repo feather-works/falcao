@@ -1,12 +1,12 @@
 //! Expressões: cada uma deixa o resultado no acumulador.
 
-use super::{Compilador, R};
+use super::{Compilador, Local, R};
 use crate::emissor::{Arg, Rotulo};
 use crate::funcao::Constante;
 use crate::instrucoes::Op;
 use falcao_sintaxe::arvore::*;
 use falcao_sintaxe::atomos::{palavras as p, Atomo};
-use falcao_sintaxe::Ref;
+use falcao_sintaxe::{Ref, TipoVinculo};
 
 /// Lugar onde se pode gravar (lado esquerdo de atribuição/atualização), já avaliado.
 #[derive(Clone, Copy)]
@@ -108,14 +108,7 @@ impl Compilador<'_> {
                 }
                 self.liberar(base);
             }
-            No::Binario { op, esq, dir } => self.binario(n, op, esq, dir)?,
-            No::Logico { op, esq, dir } => {
-                let fim = self.rotulo();
-                self.expr(esq)?;
-                self.salto_logico(op, fim);
-                self.expr(dir)?;
-                self.por(fim);
-            }
+            No::Binario { .. } | No::Logico { .. } => self.cadeia(n)?,
             No::Condicional { teste, sim, nao } => {
                 let senao = self.rotulo();
                 let fim = self.rotulo();
@@ -134,24 +127,35 @@ impl Compilador<'_> {
                 }
             }
             No::Yield { arg, delegado } => {
+                let assinc = self.f.flags.assincrona;
                 if arg.existe() {
                     self.expr(arg)?;
                 } else {
                     self.op0(Op::CarregaUndef);
                 }
+                // Retomado com `return`: sai da função pelos finally (em async, aguardando o valor).
+                let ret = self.rotulo();
+                let fim = self.rotulo();
                 if delegado {
                     let it = self.temp();
-                    self.op(Op::ObtemIterador, &[Arg::U(it), Arg::U(u32::from(self.f.flags.assincrona))]);
-                    let fim = self.rotulo();
-                    self.op(Op::Delega, &[Arg::U(it), Arg::Para(fim)]);
-                    self.por(fim);
+                    // bit 1: o iterador de verdade (throw/return chegam nele), sem atalho de array.
+                    self.op(Op::ObtemIterador, &[Arg::U(it), Arg::U(u32::from(assinc) | 2)]);
+                    self.op(Op::Delega, &[Arg::U(it), Arg::Para(fim), Arg::Para(ret)]);
                     self.liberar(it);
                 } else {
-                    if self.f.flags.assincrona {
+                    if assinc {
                         self.op0(Op::Aguarda);
                     }
                     self.op0(Op::Suspende);
+                    self.op(Op::ModoRetomada, &[Arg::Para(ret)]);
                 }
+                self.salta(Op::Salta, fim);
+                self.por(ret);
+                if assinc {
+                    self.op0(Op::Aguarda);
+                }
+                self.sair_para(0, super::Destino::Retorno);
+                self.por(fim);
             }
             No::Await(x) => {
                 self.expr(x)?;
@@ -174,6 +178,59 @@ impl Compilador<'_> {
     }
 
     /// Expressão num registrador temporário novo.
+    /// Expressão cujo valor ninguém usa (comando, passo do `for`): `i++` vira `++i`, sem guardar o
+    /// valor antigo.
+    pub(crate) fn expr_descartada(&mut self, n: NoId) -> R<()> {
+        match *self.arv.no(n) {
+            No::Atualizacao { incremento, alvo, .. } if self.reg_gravavel(alvo).is_some() => {
+                let r = self.reg_gravavel(alvo).unwrap();
+                self.posicao(n);
+                self.op(if incremento { Op::IncrementaReg } else { Op::DecrementaReg }, &[Arg::U(r), Arg::Cache]);
+                Ok(())
+            }
+            No::Atualizacao { incremento, prefixo: false, alvo } => {
+                self.posicao(n);
+                let base = self.f.topo;
+                let lugar = self.lugar(alvo)?;
+                self.ler_lugar(lugar);
+                self.op0(Op::ParaNumerico);
+                self.op(if incremento { Op::Incrementa } else { Op::Decrementa }, &[Arg::Cache]);
+                self.gravar_lugar(lugar);
+                self.liberar(base);
+                Ok(())
+            }
+            _ => self.expr(n),
+        }
+    }
+
+    /// Registrador de `n` se ele é um local em registrador já iniciado (ler não pode dar TDZ).
+    fn reg_local(&self, n: NoId) -> Option<u32> {
+        let No::Nome(_) = *self.arv.no(n) else { return None };
+        let Some(Ref::Vinculo(v)) = self.esc.referencia(n) else { return None };
+        match self.local(v) {
+            Some(Local::Reg(r)) if !self.lexico(v) || self.f.iniciados.contains_key(&v.0) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// Como [`Self::reg_local`], e gravar nele também é só `Guarda` (não é `const`).
+    fn reg_gravavel(&self, n: NoId) -> Option<u32> {
+        let r = self.reg_local(n)?;
+        let Some(Ref::Vinculo(v)) = self.esc.referencia(n) else { return None };
+        (self.esc.vinculo(v).tipo != TipoVinculo::Const).then_some(r)
+    }
+
+    /// Ler `n` não muda nenhum local em registrador: literal, nome ou leitura de propriedade
+    /// deles. (Getter e chamada não alcançam local que não foi capturado; atribuição alcançaria.)
+    fn sem_efeito_em_registrador(&self, n: NoId) -> bool {
+        match *self.arv.no(n) {
+            No::Numero(_) | No::Texto(_) | No::Nome(_) | No::This | No::Nulo | No::Verdadeiro | No::Falso => true,
+            No::Membro { obj, opcional: false, .. } => self.sem_efeito_em_registrador(obj),
+            No::Indice { obj, prop, opcional: false } => self.sem_efeito_em_registrador(obj) && self.sem_efeito_em_registrador(prop),
+            _ => false,
+        }
+    }
+
     pub(crate) fn expr_reg(&mut self, n: NoId) -> R<u32> {
         let r = self.temp();
         self.expr(n)?;
@@ -324,8 +381,9 @@ impl Compilador<'_> {
                 self.op(Op::CarregaConst, &[Arg::U(k)]);
             }
             Chave::Privada(a) => {
-                let k = self.k_privado(a);
-                self.op(Op::ChavePrivada, &[Arg::U(k)]);
+                // Chave de elemento da classe que está sendo montada (o escopo atual é o dela).
+                let v = self.esc.privados[&(self.f.escopo.0, a)];
+                self.ler_vinculo(v, a);
                 self.op(Op::Guarda, &[Arg::U(r)]);
                 return Ok(r);
             }
@@ -361,12 +419,21 @@ impl Compilador<'_> {
                         } else if let Some(u) = fixa {
                             self.expr_nomeada(valor, u.clone())?;
                             let k = self.k_nome_texto(u);
-                            self.op(Op::DefProp, &[Arg::U(t), Arg::U(k)]);
+                            self.op(Op::DefProp, &[Arg::U(t), Arg::U(k), Arg::Cache]);
                         } else {
                             let rk = self.chave_reg(chave)?;
                             match self.texto_da_chave(chave) {
                                 Some(u) => self.expr_nomeada(valor, u)?,
-                                None => self.expr(valor)?,
+                                None => {
+                                    self.expr(valor)?;
+                                    let mut v = valor;
+                                    while let No::Paren(x) = *self.arv.no(v) {
+                                        v = x;
+                                    }
+                                    if matches!(*self.arv.no(v), No::Funcao(f) if self.arv.funcao(f).nome.is_none()) {
+                                        self.op(Op::NomeiaFuncao, &[Arg::U(rk), Arg::U(0)]);
+                                    }
+                                }
                             }
                             self.op(Op::DefItem, &[Arg::U(t), Arg::U(rk)]);
                         }
@@ -374,12 +441,14 @@ impl Compilador<'_> {
                     TipoProp::Metodo => {
                         let rk = self.chave_reg(chave)?;
                         self.metodo_valor(valor, t)?;
+                        self.op(Op::NomeiaFuncao, &[Arg::U(rk), Arg::U(0)]);
                         self.op(Op::DefItem, &[Arg::U(t), Arg::U(rk)]);
                     }
                     TipoProp::Get | TipoProp::Set => {
                         let rk = self.chave_reg(chave)?;
                         self.metodo_valor(valor, t)?;
                         let n = if tipo == TipoProp::Get { 0 } else { 1 };
+                        self.op(Op::NomeiaFuncao, &[Arg::U(rk), Arg::U(n + 1)]);
                         self.op(Op::DefAcessor, &[Arg::U(t), Arg::U(rk), Arg::U(n)]);
                     }
                 },
@@ -432,22 +501,29 @@ impl Compilador<'_> {
                     self.liberar(base);
                     return Ok(());
                 }
-                let r = self.temp();
-                self.expr(obj)?;
-                self.opcional(opcional);
-                self.op(Op::Guarda, &[Arg::U(r)]);
-                self.expr(prop)?;
-                self.posicao(n);
-                self.op(Op::LeItem, &[Arg::U(r), Arg::Cache]);
-                self.liberar(r);
+                // `a[i]` com `a` local em registrador e `i` que não o muda: usa o registrador direto.
+                if let Some(ro) = self.reg_local(obj).filter(|_| !opcional && self.sem_efeito_em_registrador(prop)) {
+                    self.expr(prop)?;
+                    self.posicao(n);
+                    self.op(Op::LeItem, &[Arg::U(ro), Arg::Cache]);
+                } else {
+                    let r = self.temp();
+                    self.expr(obj)?;
+                    self.opcional(opcional);
+                    self.op(Op::Guarda, &[Arg::U(r)]);
+                    self.expr(prop)?;
+                    self.posicao(n);
+                    self.op(Op::LeItem, &[Arg::U(r), Arg::Cache]);
+                    self.liberar(r);
+                }
             }
             No::MembroPrivado { obj, prop, opcional } => {
                 let r = self.temp();
                 self.expr(obj)?;
                 self.opcional(opcional);
                 self.op(Op::Guarda, &[Arg::U(r)]);
-                let k = self.k_privado(prop);
-                self.op(Op::LePrivado, &[Arg::U(r), Arg::U(k)]);
+                let rk = self.nome_privado(n, prop);
+                self.op(Op::LePrivado, &[Arg::U(r), Arg::U(rk)]);
                 self.liberar(r);
             }
             _ => unreachable!(),
@@ -455,9 +531,19 @@ impl Compilador<'_> {
         Ok(())
     }
 
-    pub(crate) fn k_privado(&mut self, a: Atomo) -> u32 {
-        let u: Vec<u16> = format!("#{}", self.lex.atomos.texto(a)).encode_utf16().collect();
-        self.k_nome_texto(u)
+    /// Registrador com o nome privado (símbolo) a que o uso `no` (`o.#a`, `#a in`) se refere.
+    pub(crate) fn nome_privado(&mut self, no: NoId, a: Atomo) -> u32 {
+        let r = self.temp();
+        match self.esc.referencia(no) {
+            Some(Ref::Vinculo(v)) => self.ler_vinculo(v, a),
+            // Só no `eval` dentro de classe (que ainda não enxerga os nomes de fora).
+            _ => {
+                let k = self.k_texto("nome privado fora da classe que o declara".encode_utf16().collect());
+                self.op(Op::LancaErro, &[Arg::U(k)]);
+            }
+        }
+        self.op(Op::Guarda, &[Arg::U(r)]);
+        r
     }
 
     /// Depois de avaliar o objeto de um `?.`: se é null/undefined, a cadeia toda vale undefined.
@@ -499,8 +585,9 @@ impl Compilador<'_> {
                 self.expr(obj)?;
                 self.opcional(opcional);
                 self.op(Op::Guarda, &[Arg::U(rthis)]);
-                let k = self.k_privado(prop);
-                self.op(Op::LePrivado, &[Arg::U(rthis), Arg::U(k)]);
+                let rk = self.nome_privado(func, prop);
+                self.op(Op::LePrivado, &[Arg::U(rthis), Arg::U(rk)]);
+                self.liberar(rk);
             }
             No::Membro { obj, .. } | No::Indice { obj, .. } if matches!(self.arv.no(obj), No::Super) => {
                 self.membro(func)?;
@@ -650,25 +737,86 @@ impl Compilador<'_> {
         n
     }
 
-    fn binario(&mut self, n: NoId, op: OpBinario, esq: NoId, dir: NoId) -> R<()> {
-        if op == OpBinario::InPrivado {
-            let No::Nome(a) = *self.arv.no(esq) else { return self.erro(esq, "#nome inválido") };
-            self.expr(dir)?;
-            let k = self.k_privado(a);
-            self.op(Op::TemPrivado, &[Arg::U(k)]);
-            return Ok(());
+    /// `a + b + c …` e `a && b || c …`: a árvore é funda à esquerda, então o gerador desce pela
+    /// espinha num laço (texto montado com milhares de `+` não estoura a pilha).
+    fn cadeia(&mut self, n: NoId) -> R<()> {
+        let mut espinha = Vec::new();
+        let mut folha = n;
+        loop {
+            let esq = match *self.arv.no(folha) {
+                No::Binario { op, esq, .. } if op != OpBinario::InPrivado => esq,
+                No::Logico { esq, .. } => esq,
+                _ => break,
+            };
+            espinha.push(folha);
+            folha = esq;
+        }
+        // `s + i`, `i < n`: o lado esquerdo já está num registrador e o direito não o muda, então
+        // a operação lê o registrador direto, sem copiar para um temporário.
+        let mut niveis = &espinha[..];
+        if let (Some(&no), Some(r)) = (espinha.last(), self.reg_local(folha)) {
+            if let No::Binario { op, dir, .. } = *self.arv.no(no) {
+                let imediato = matches!((op, *self.arv.no(dir)), (OpBinario::Soma | OpBinario::Sub, No::Numero(_)));
+                if !imediato && self.sem_efeito_em_registrador(dir) {
+                    self.expr(dir)?;
+                    self.posicao(no);
+                    self.op_binario(op, r);
+                    niveis = &espinha[..espinha.len() - 1];
+                }
+            }
+        }
+        if niveis.len() == espinha.len() {
+            match *self.arv.no(folha) {
+                // `#x in obj`.
+                No::Binario { esq, dir, .. } => {
+                    let No::NomePrivado(a) = *self.arv.no(esq) else { return self.erro(esq, "#nome inválido") };
+                    self.expr(dir)?;
+                    let t = self.temp();
+                    self.op(Op::Guarda, &[Arg::U(t)]);
+                    let rk = self.nome_privado(esq, a);
+                    self.op(Op::Carrega, &[Arg::U(t)]);
+                    self.op(Op::TemPrivado, &[Arg::U(rk)]);
+                    self.liberar(t);
+                }
+                _ => self.expr(folha)?,
+            }
+        }
+        for &no in niveis.iter().rev() {
+            match *self.arv.no(no) {
+                No::Binario { op, dir, .. } => self.binario_com_acc(no, op, dir)?,
+                No::Logico { op, dir, .. } => {
+                    let fim = self.rotulo();
+                    self.salto_logico(op, fim);
+                    self.expr(dir)?;
+                    self.por(fim);
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+
+    /// acc = acc op `dir` (o lado esquerdo já está no acc).
+    fn binario_com_acc(&mut self, n: NoId, op: OpBinario, dir: NoId) -> R<()> {
+        // `x | 0`: uma instrução, sem registrador.
+        if let (OpBinario::Ou, No::Numero(v)) = (op, *self.arv.no(dir)) {
+            if v == 0.0 {
+                self.posicao(n);
+                self.op(Op::ParaInt32, &[Arg::Cache]);
+                return Ok(());
+            }
         }
         // `x + 1`, `i - 1`: soma com imediato, sem registrador.
         if let (OpBinario::Soma | OpBinario::Sub, No::Numero(v)) = (op, *self.arv.no(dir)) {
             if v.fract() == 0.0 && v.abs() < 1e9 && v != 0.0 {
-                self.expr(esq)?;
                 self.posicao(n);
                 let i = if op == OpBinario::Soma { v as i32 } else { -(v as i32) };
                 self.op(Op::SomaInt, &[Arg::I(i), Arg::Cache]);
                 return Ok(());
             }
         }
-        let r = self.expr_reg(esq)?;
+        let r = self.temp();
+        self.op(Op::Guarda, &[Arg::U(r)]);
         self.expr(dir)?;
         self.posicao(n);
         self.op_binario(op, r);
@@ -745,8 +893,8 @@ impl Compilador<'_> {
                 }
             }
             No::MembroPrivado { obj, prop, .. } => {
-                let k = self.k_privado(prop);
-                Lugar::Privado(self.expr_reg(obj)?, k)
+                let ro = self.expr_reg(obj)?;
+                Lugar::Privado(ro, self.nome_privado(alvo, prop))
             }
             // Anexo B: `f() = 1` avalia `f()` e dá ReferenceError.
             No::Chamada { .. } => {

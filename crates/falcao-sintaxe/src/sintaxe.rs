@@ -45,6 +45,13 @@ pub(crate) struct Ctx {
     pub em_classe: bool,
     /// Inicializador de campo de classe: `arguments` proibido.
     pub em_campo: bool,
+    /// `arguments` proibido (inicializador de campo, bloco `static`), também dentro das setas
+    /// e chaves calculadas de lá; só uma função comum o libera.
+    pub sem_arguments: bool,
+    /// Corpo de bloco `static` (fora de função aninhada): `return` proibido.
+    pub sem_return: bool,
+    /// Bloco `static` (e setas dentro dele): `await` não vale como nome.
+    pub sem_await: bool,
     /// Topo de módulo: `await` no topo.
     pub modulo: bool,
 }
@@ -63,10 +70,30 @@ pub struct Analisador<'a> {
     /// `{ a = 1 }` lido como objeto: só vale se virar padrão. Posições pendentes.
     pub(crate) pendentes: Vec<u32>,
     pub(crate) rotulos: Vec<(Atomo, bool)>,
+    /// Início do item (StatementListItem) atual: `rótulo: function` só vale aí, não como corpo
+    /// de `if`/laço/`with`.
+    pub(crate) item_em: u32,
+    /// `...x` seguido de vírgula (`[...x,]`): vale como literal, não como padrão.
+    pub(crate) resto_com_virgula: crate::atomos::MapaRapido<u32, ()>,
     /// Posições de `(` onde a tentativa de ler parâmetros de seta já falhou: sem isto,
     /// `(a = (b = (c …` aninhado custaria 2^n.
     pub(crate) nao_e_seta: crate::atomos::MapaRapido<u32, ()>,
+    /// Expressões e comandos abertos agora (ver [`Analisador::fundo`]).
+    profundidade: u32,
+    /// Uma moldura por corpo de classe aberto: nomes privados declarados (nome, tipo, estático)
+    /// e usados (nome, posição). No fim da classe, uso sem declaração sobe para a classe de
+    /// fora; sem classe de fora, é erro (AllPrivateIdentifiersValid).
+    pub(crate) privados: Vec<MolduraPrivada>,
 }
+
+#[derive(Default)]
+pub(crate) struct MolduraPrivada {
+    pub(crate) declarados: Vec<(Atomo, u8, bool)>,
+    pub(crate) usados: Vec<(Atomo, u32)>,
+}
+
+/// Níveis de [`Analisador::fundo`] (cada um gasta pilha na sintaxe, nos escopos e no gerador).
+const LIMITE_PROFUNDIDADE: u32 = 1000;
 
 /// Estado salvo para voltar atrás (tentativa de seta).
 pub(crate) struct Marca {
@@ -80,6 +107,8 @@ pub(crate) struct Marca {
     rascunho: usize,
     pendentes: usize,
     ctx: Ctx,
+    profundidade: u32,
+    privados: usize,
 }
 
 /// Lê um script inteiro.
@@ -112,7 +141,7 @@ impl<'a> Analisador<'a> {
             listas: Vec::with_capacity(tam / 2),
             ..Arvore::default()
         };
-        Ok(Self { lex, atual, fim_anterior: 0, arv, rascunho: Vec::with_capacity(256), ctx, funcao: None, pendentes: Vec::new(), rotulos: Vec::new(), nao_e_seta: Default::default() })
+        Ok(Self { lex, atual, fim_anterior: 0, arv, rascunho: Vec::with_capacity(256), ctx, funcao: None, pendentes: Vec::new(), rotulos: Vec::new(), item_em: u32::MAX, resto_com_virgula: Default::default(), nao_e_seta: Default::default(), profundidade: 0, privados: Vec::new() })
     }
 
     // ---------------------------------------------------------------- símbolos
@@ -187,6 +216,24 @@ impl<'a> Analisador<'a> {
         }
     }
 
+    /// Roda `f` um nível mais fundo. Texto aninhado demais (`[[[[…`, `((((…`) estouraria a
+    /// pilha do Rust aqui, no gerador ou no intérprete: vira erro de sintaxe.
+    pub(crate) fn fundo<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
+        self.descer()?;
+        let r = f(self);
+        self.profundidade -= 1;
+        r
+    }
+
+    /// Um nível a mais; quem chama devolve a profundidade (ou a [`Marca`] devolve).
+    fn descer(&mut self) -> R<()> {
+        if self.profundidade >= LIMITE_PROFUNDIDADE {
+            return self.erro_aqui("aninhamento fundo demais");
+        }
+        self.profundidade += 1;
+        Ok(())
+    }
+
     pub(crate) fn erro<T>(&self, posicao: u32, msg: &str) -> R<T> {
         Err(ErroSintaxe { posicao, mensagem: msg.to_string() })
     }
@@ -222,6 +269,8 @@ impl<'a> Analisador<'a> {
             rascunho: self.rascunho.len(),
             pendentes: self.pendentes.len(),
             ctx: self.ctx,
+            profundidade: self.profundidade,
+            privados: self.privados.len(),
         }
     }
 
@@ -237,6 +286,56 @@ impl<'a> Analisador<'a> {
         self.rascunho.truncate(m.rascunho);
         self.pendentes.truncate(m.pendentes);
         self.ctx = m.ctx;
+        self.profundidade = m.profundidade;
+        self.privados.truncate(m.privados);
+    }
+
+    // ---------------------------------------------------------------- nomes privados
+
+    pub(crate) fn sem_paren(&self, mut n: NoId) -> NoId {
+        while let No::Paren(x) = *self.arv.no(n) {
+            n = x;
+        }
+        n
+    }
+
+    /// Anota o uso de `#a` na classe aberta (conferido quando ela fecha).
+    pub(crate) fn usar_privado(&mut self, a: Atomo, pos: u32) {
+        if let Some(m) = self.privados.last_mut() {
+            m.usados.push((a, pos));
+        }
+    }
+
+    /// Declara `#a` na classe aberta. `tipo`: 0 campo/método, 1 getter, 2 setter. Getter e
+    /// setter do mesmo nome (e mesmo `static`) formam um par; qualquer outra repetição é erro.
+    pub(crate) fn declarar_privado(&mut self, a: Atomo, tipo: u8, estatico: bool, pos: u32) -> R<()> {
+        if a == p::CONSTRUCTOR {
+            return self.erro(pos, "#constructor não é nome privado válido");
+        }
+        let m = self.privados.last_mut().expect("membro de classe sem moldura");
+        for &(b, t, e) in &m.declarados {
+            if b == a && !(t != 0 && tipo != 0 && t != tipo && e == estatico) {
+                return self.erro(pos, "nome privado repetido");
+            }
+        }
+        m.declarados.push((a, tipo, estatico));
+        Ok(())
+    }
+
+    /// Fecha a moldura da classe: o que foi usado e não declarado aqui sobe para a classe de
+    /// fora, ou é erro.
+    pub(crate) fn fechar_privados(&mut self) -> R<()> {
+        let m = self.privados.pop().expect("classe sem moldura");
+        for (a, pos) in m.usados {
+            if m.declarados.iter().any(|d| d.0 == a) {
+                continue;
+            }
+            match self.privados.last_mut() {
+                Some(fora) => fora.usados.push((a, pos)),
+                None => return self.erro(pos, "nome privado não declarado"),
+            }
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------------- arena
@@ -300,10 +399,10 @@ impl<'a> Analisador<'a> {
         if a == p::YIELD && self.ctx.gerador {
             return self.erro(pos, "'yield' não pode ser nome dentro de gerador");
         }
-        if a == p::AWAIT && (self.ctx.assincrona || self.ctx.modulo) {
+        if a == p::AWAIT && (self.ctx.assincrona || self.ctx.modulo || self.ctx.sem_await) {
             return self.erro(pos, "'await' não pode ser nome aqui");
         }
-        if a == p::ARGUMENTS && self.ctx.em_campo {
+        if a == p::ARGUMENTS && self.ctx.sem_arguments {
             return self.erro(pos, "'arguments' em inicializador de campo");
         }
         Ok(())
@@ -362,6 +461,10 @@ impl<'a> Analisador<'a> {
 
     /// `AssignmentExpression`.
     pub(crate) fn atribuicao(&mut self) -> R<NoId> {
+        self.fundo(Self::atribuicao_nivel)
+    }
+
+    fn atribuicao_nivel(&mut self) -> R<NoId> {
         let pos = self.atual.inicio;
         // yield
         if self.ctx.gerador && self.palavra(p::YIELD) {
@@ -399,6 +502,14 @@ impl<'a> Analisador<'a> {
         } else {
             self.conferir_pendentes(antes)?;
             self.alvo_simples(esq)?;
+            // `f() &&= 1`: a exceção do Anexo B para chamadas não vale nos operadores lógicos.
+            let mut e = esq;
+            while let No::Paren(x) = *self.arv.no(e) {
+                e = x;
+            }
+            if matches!(op, OpAtrib::Log(_)) && matches!(self.arv.no(e), No::Chamada { .. }) {
+                return self.erro(pos, "alvo de atribuição inválido");
+            }
         }
         self.avancar()?;
         let valor = self.atribuicao()?;
@@ -432,7 +543,7 @@ impl<'a> Analisador<'a> {
                     match *self.arv.no(item) {
                         No::Buraco => {}
                         No::Espalhar(x) => {
-                            if i + 1 != n {
+                            if i + 1 != n || self.resto_com_virgula.contains_key(&item.0) {
                                 return self.erro(self.arv.posicao(item), "o resto (...) tem de ser o último");
                             }
                             self.para_padrao(x, declaracao)?;
@@ -451,10 +562,10 @@ impl<'a> Analisador<'a> {
                     match *self.arv.no(item) {
                         No::Propriedade { valor, tipo: TipoProp::Normal | TipoProp::Curta, .. } => self.item_padrao(valor, declaracao)?,
                         No::Espalhar(x) => {
-                            if i + 1 != n {
+                            if i + 1 != n || self.resto_com_virgula.contains_key(&item.0) {
                                 return self.erro(self.arv.posicao(item), "o resto (...) tem de ser o último");
                             }
-                            if !matches!(self.arv.no(x), No::Nome(_)) && (declaracao || !matches!(self.arv.no(x), No::Membro { .. } | No::Indice { .. })) {
+                            if !matches!(self.arv.no(x), No::Nome(_)) && (declaracao || !matches!(self.arv.no(x), No::Membro { .. } | No::Indice { .. } | No::MembroPrivado { .. })) {
                                 return self.erro(self.arv.posicao(x), "resto de objeto só aceita nome");
                             }
                             self.para_padrao(x, declaracao)?;
@@ -566,17 +677,27 @@ impl<'a> Analisador<'a> {
             if !self.palavra(p::IN) || self.ctx.sem_in || minimo > 8 {
                 return self.erro(pos, "#nome solto só vale antes de 'in'");
             }
+            if !self.ctx.em_classe {
+                return self.erro(pos, "#nome fora de classe");
+            }
             self.avancar()?;
             let dir = self.binaria(9)?;
-            let nome = self.no(No::Nome(a), pos);
+            self.usar_privado(a, pos);
+            let nome = self.no(No::NomePrivado(a), pos);
             self.no(No::Binario { op: OpBinario::InPrivado, esq: nome, dir }, pos)
         } else {
             self.unaria()?
         };
         let mut misturou: Option<OpLogico> = None;
+        // `a + b + c …` fica funda à esquerda, e escopos e gerador a percorrem num laço; já
+        // `a ** b ** c` é funda à direita: cada `**` é um nível.
+        let base = self.profundidade;
         while let Some((op, prec)) = self.op_binario() {
             if prec <= minimo {
                 break;
+            }
+            if prec == 12 {
+                self.descer()?;
             }
             // `**` é associativo à direita e não aceita unário sem parênteses à esquerda.
             if prec == 12 {
@@ -606,10 +727,15 @@ impl<'a> Analisador<'a> {
                 Op::Log(l) => self.no(No::Logico { op: l, esq, dir }, pos),
             };
         }
+        self.profundidade = base;
         Ok(esq)
     }
 
     fn unaria(&mut self) -> R<NoId> {
+        self.fundo(Self::unaria_nivel)
+    }
+
+    fn unaria_nivel(&mut self) -> R<NoId> {
         let pos = self.atual.inicio;
         let op = match self.atual.tipo {
             Tipo::Pont(Pont::Menos) => Some(OpUnario::Menos),
@@ -624,10 +750,10 @@ impl<'a> Analisador<'a> {
         if let Some(op) = op {
             self.avancar()?;
             let arg = self.unaria()?;
-            if op == OpUnario::Delete && self.ctx.estrito && matches!(self.arv.no(arg), No::Nome(_)) {
+            if op == OpUnario::Delete && self.ctx.estrito && matches!(self.arv.no(self.sem_paren(arg)), No::Nome(_)) {
                 return self.erro(pos, "delete de nome no modo estrito");
             }
-            if op == OpUnario::Delete && matches!(self.arv.no(arg), No::MembroPrivado { .. }) {
+            if op == OpUnario::Delete && matches!(self.arv.no(self.sem_paren(arg)), No::MembroPrivado { .. }) {
                 return self.erro(pos, "delete de campo privado");
             }
             return Ok(self.no(No::Unario { op, arg }, pos));
@@ -664,7 +790,12 @@ impl<'a> Analisador<'a> {
         let pos = self.atual.inicio;
         let mut e = if self.palavra(p::NEW) { self.new_()? } else { self.primaria()? };
         let mut opcional = false;
+        // Cada elo de `a.b(c)[d]…` é um nível da árvore, como em `binaria`.
+        let base = self.profundidade;
         loop {
+            if matches!(self.atual.tipo, Tipo::Pont(Pont::Ponto | Pont::InterrogacaoPonto | Pont::AbreColchete | Pont::AbreParen) | Tipo::Template(_)) {
+                self.descer()?;
+            }
             match self.atual.tipo {
                 Tipo::Pont(Pont::Ponto) => {
                     self.avancar()?;
@@ -713,6 +844,7 @@ impl<'a> Analisador<'a> {
                 _ => break,
             }
         }
+        self.profundidade = base;
         if opcional {
             e = self.no(No::CadeiaOpcional(e), pos);
         }
@@ -738,6 +870,7 @@ impl<'a> Analisador<'a> {
                 if !self.ctx.em_classe {
                     return self.erro_aqui("#nome fora de classe");
                 }
+                self.usar_privado(prop, self.atual.inicio);
                 self.avancar()?;
                 Ok(self.no(No::MembroPrivado { obj, prop, opcional }, pos))
             }
@@ -1007,6 +1140,9 @@ impl<'a> Analisador<'a> {
             if !self.comer(Pont::Virgula)? {
                 break;
             }
+            if matches!(self.arv.no(item), No::Espalhar(_)) {
+                self.resto_com_virgula.insert(item.0, ());
+            }
         }
         self.ctx.sem_in = sem_in;
         self.esperar(Pont::FechaColchete)?;
@@ -1046,11 +1182,27 @@ impl<'a> Analisador<'a> {
         let sem_in = self.ctx.sem_in;
         self.ctx.sem_in = false;
         let base = self.rascunho.len();
+        let mut proto = false;
         while !self.e(Pont::FechaChave) {
+            let ip = self.atual.inicio;
             let item = self.propriedade()?;
             self.rascunho.push(item);
+            // `__proto__: x` duas vezes: erro, a não ser que o objeto vire padrão.
+            if let No::Propriedade { chave, tipo: TipoProp::Normal, .. } = *self.arv.no(item) {
+                let e_proto = match chave {
+                    Chave::Atomo(a) => self.lex.atomos.texto(a) == "__proto__",
+                    Chave::Texto(TextoRef::Faixa(a, b)) => &self.lex.fonte()[a as usize..b as usize] == "__proto__",
+                    _ => false,
+                };
+                if e_proto && std::mem::replace(&mut proto, true) {
+                    self.pendentes.push(ip);
+                }
+            }
             if !self.comer(Pont::Virgula)? {
                 break;
+            }
+            if matches!(self.arv.no(item), No::Espalhar(_)) {
+                self.resto_com_virgula.insert(item.0, ());
             }
         }
         self.ctx.sem_in = sem_in;

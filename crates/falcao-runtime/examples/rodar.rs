@@ -15,4 +15,7 @@ fn main() {
         m.rodar_microtarefas();
         eprintln!("[{caminho}: {:.1} ms]", t.elapsed().as_secs_f64() * 1000.0);
     }
+    if std::env::var_os("FALCAO_PERFIL").is_some() {
+        eprint!("{}", m.relatorio_perfil());
+    }
 }

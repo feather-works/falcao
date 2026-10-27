@@ -8,7 +8,10 @@
 use std::cmp::Ordering;
 
 /// Maior BigInt aceito, em bits (passar disso dá RangeError, como nos outros motores).
-pub const MAX_BITS: u64 = 1 << 30;
+/// shortcut: 2^20 (o V8 aceita 2^30) porque multiplicar e `toString` são quadráticos e não
+/// param no botão Parar (1M bits já leva ~2 s); upgrade: Karatsuba/FFT e então 2^30.
+/// O léxico tem o mesmo limite para literais (`BIGINT_MAX_BITS`).
+pub const MAX_BITS: u64 = 1 << 20;
 
 /// Inteiro de precisão arbitrária. Sempre normalizado: sem palavra zero no topo, e o zero
 /// nunca é negativo.
@@ -289,6 +292,10 @@ impl Grande {
 
     /// Dígitos ASCII numa base (sem sinal nem prefixo); `None` se algum não vale.
     pub fn de_digitos(digitos: &[u8], base: u32) -> Option<Self> {
+        // Quadrático: `BigInt("9".repeat(1e7))` travaria sem este teto.
+        if digitos.len() as u64 * u64::from(base.ilog2() + u32::from(!base.is_power_of_two())) > MAX_BITS + 64 {
+            return None;
+        }
         let mut mag: Vec<u32> = Vec::new();
         for &c in digitos {
             let d = (c as char).to_digit(base)?;

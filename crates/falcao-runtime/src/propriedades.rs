@@ -111,6 +111,9 @@ impl Motor {
             }
             ChaveProp::Nome(c) => {
                 let classe = self.formas.get(self.forma(o)).classe;
+                if classe == Classe::ArrayTipado && self.numerico_canonico(c) {
+                    return None;
+                }
                 if c == fixos::LENGTH {
                     if classe == Classe::Array {
                         let n = self.array_len(o);
@@ -162,8 +165,17 @@ impl Motor {
     /// `[[Get]]` de `o` com o receptor dado (para getters).
     pub fn obter_com(&mut self, mut o: Valor, k: ChaveProp, receptor: Valor) -> Res<Valor> {
         loop {
-            if self.formas.get(self.forma(o)).classe == Classe::Proxy {
+            let classe = self.formas.get(self.forma(o)).classe;
+            if classe == Classe::Proxy {
                 return self.proxy_obter(o, k, receptor);
+            }
+            // Chave numérica de array tipado: o item ou undefined, sem subir no protótipo.
+            if classe == Classe::ArrayTipado {
+                match k {
+                    ChaveProp::Indice(i) => return Ok(self.tipado_ler(o, i).unwrap_or(Valor::UNDEFINED)),
+                    ChaveProp::Nome(c) if self.numerico_canonico(c) => return Ok(Valor::UNDEFINED),
+                    _ => {}
+                }
             }
             match k {
                 ChaveProp::Nome(c) if !(c == fixos::LENGTH && matches!(self.formas.get(self.forma(o)).classe, Classe::Array | Classe::Caixa)) => {
@@ -294,6 +306,18 @@ impl Motor {
         if classe == Classe::Proxy {
             return self.proxy_gravar(o, k, v, receptor);
         }
+        if classe == Classe::ArrayTipado {
+            if let Some(i) = self.tipado_chave(o, k) {
+                if receptor == o {
+                    // Converte mesmo se o índice não vale (o valueOf roda).
+                    self.tipado_gravar(o, i.unwrap_or(u32::MAX), v)?;
+                    return Ok(true);
+                }
+                if !i.is_some_and(|i| i < self.tipado_len(o)) {
+                    return Ok(true);
+                }
+            }
+        }
         if receptor == o {
             match k {
                 ChaveProp::Nome(c) if !(c == fixos::LENGTH && matches!(classe, Classe::Array | Classe::Caixa)) => {
@@ -326,6 +350,17 @@ impl Motor {
         loop {
             if self.formas.get(self.forma(p)).classe == Classe::Proxy && p != o {
                 return self.proxy_gravar(p, k, v, receptor);
+            }
+            if p != o && self.formas.get(self.forma(p)).classe == Classe::ArrayTipado {
+                if let Some(i) = self.tipado_chave(p, k) {
+                    if p == receptor {
+                        self.tipado_gravar(p, i.unwrap_or(u32::MAX), v)?;
+                        return Ok(true);
+                    }
+                    if !i.is_some_and(|i| i < self.tipado_len(p)) {
+                        return Ok(true);
+                    }
+                }
             }
             if let Some(d) = self.descritor_proprio(p, k) {
                 if d.acessor() {
@@ -375,6 +410,9 @@ impl Motor {
 
     /// CreateDataProperty: define dado próprio enumerável/gravável/configurável.
     pub fn criar_dado(&mut self, o: Valor, k: ChaveProp, v: Valor) -> Res<bool> {
+        if self.formas.get(self.forma(o)).classe == Classe::Proxy {
+            return self.proxy_criar_dado(o, k, v);
+        }
         match k {
             ChaveProp::Indice(i) => {
                 if self.indices_especiais {
@@ -424,11 +462,15 @@ impl Motor {
     // ---------------------------------------------------------------- defineProperty
 
     /// `[[DefineOwnProperty]]` com validação (§10.1.6.3). Devolve falso se não pode.
-    pub fn definir_propriedade(&mut self, o: Valor, k: ChaveProp, d: DescParcial) -> Res<bool> {
-        if self.formas.get(self.forma(o)).classe == Classe::Proxy {
-            // shortcut: Proxy sem armadilha defineProperty: define no alvo.
-            let alvo = Valor(self.interno(o, 0));
-            return self.definir_propriedade(alvo, k, d);
+    pub fn definir_propriedade(&mut self, mut o: Valor, k: ChaveProp, d: DescParcial) -> Res<bool> {
+        // shortcut: Proxy sem armadilha defineProperty: define no alvo.
+        while self.formas.get(self.forma(o)).classe == Classe::Proxy {
+            o = Valor(self.interno(o, 0));
+        }
+        if let ChaveProp::Nome(c) = k {
+            if self.formas.get(self.forma(o)).classe == Classe::ArrayTipado && self.numerico_canonico(c) {
+                return Ok(false);
+            }
         }
         if let ChaveProp::Indice(i) = k {
             if self.formas.get(self.forma(o)).classe == Classe::ArrayTipado {
@@ -580,6 +622,10 @@ impl Motor {
             if self.tem_propria(o, k) {
                 return Ok(true);
             }
+            // Índice de TypedArray fora do tamanho: não existe, e não se procura no protótipo.
+            if self.formas.get(self.forma(o)).classe == Classe::ArrayTipado && self.tipado_chave(o, k).is_some() {
+                return Ok(false);
+            }
             o = self.proto_de(o);
             if o == Valor::NULL {
                 return Ok(false);
@@ -595,10 +641,9 @@ impl Motor {
     }
 
     /// `delete o[k]`; falso se não é configurável.
-    pub fn apagar(&mut self, o: Valor, k: ChaveProp) -> Res<bool> {
-        if self.formas.get(self.forma(o)).classe == Classe::Proxy {
-            let alvo = Valor(self.interno(o, 0));
-            return self.apagar(alvo, k);
+    pub fn apagar(&mut self, mut o: Valor, k: ChaveProp) -> Res<bool> {
+        while self.formas.get(self.forma(o)).classe == Classe::Proxy {
+            o = Valor(self.interno(o, 0));
         }
         Ok(match k {
             ChaveProp::Indice(i) if self.formas.get(self.forma(o)).classe == Classe::ArrayTipado => i >= self.tipado_len(o),
@@ -623,11 +668,10 @@ impl Motor {
 
     /// `[[OwnPropertyKeys]]`: índices em ordem, depois nomes, depois símbolos (na ordem de
     /// criação). `enumeraveis`: só as enumeráveis; `simbolos`: inclui símbolos; `nomes`: inclui textos.
-    pub fn chaves_de(&mut self, o: Valor, enumeraveis: bool, nomes: bool, simbolos: bool) -> Vec<ChaveProp> {
+    pub fn chaves_de(&mut self, mut o: Valor, enumeraveis: bool, nomes: bool, simbolos: bool) -> Vec<ChaveProp> {
         let mut r = Vec::new();
-        if self.formas.get(self.forma(o)).classe == Classe::Proxy {
-            let alvo = Valor(self.interno(o, 0));
-            return self.chaves_de(alvo, enumeraveis, nomes, simbolos);
+        while self.formas.get(self.forma(o)).classe == Classe::Proxy {
+            o = Valor(self.interno(o, 0));
         }
         if nomes {
             if self.formas.get(self.forma(o)).classe == Classe::ArrayTipado {
@@ -705,23 +749,42 @@ impl Motor {
     }
 
     fn proxy_obter(&mut self, p: Valor, k: ChaveProp, receptor: Valor) -> Res<Valor> {
+        self.checar_pilha()?;
         let alvo = Valor(self.interno(p, 0));
         match self.armadilha(p, "get")? {
             Some((f, t)) => {
                 let kv = self.chave_para_valor(k);
-                self.chamar(f, t, &[alvo, kv, receptor])
+                let v = self.chamar(f, t, &[alvo, kv, receptor])?;
+                // Invariantes (§10.5.8): a armadilha não pode mentir sobre o que o alvo fixou.
+                if let Some(d) = self.descritor_proprio(alvo, k).filter(|d| d.attrs & attr::CONFIGURAVEL == 0) {
+                    let fixo = !d.acessor() && d.attrs & attr::GRAVAVEL == 0;
+                    if (fixo && !self.mesmo_valor(v, d.valor)) || (d.acessor() && d.get == Valor::UNDEFINED && v != Valor::UNDEFINED) {
+                        return self.erro_tipo("'get' on proxy: result differs from the non-configurable target property");
+                    }
+                }
+                Ok(v)
             }
             None => self.obter_com(alvo, k, receptor),
         }
     }
 
     fn proxy_gravar(&mut self, p: Valor, k: ChaveProp, v: Valor, receptor: Valor) -> Res<bool> {
+        self.checar_pilha()?;
         let alvo = Valor(self.interno(p, 0));
         match self.armadilha(p, "set")? {
             Some((f, t)) => {
                 let kv = self.chave_para_valor(k);
                 let r = self.chamar(f, t, &[alvo, kv, v, receptor])?;
-                Ok(self.verdadeiro(r))
+                if !self.verdadeiro(r) {
+                    return Ok(false);
+                }
+                if let Some(d) = self.descritor_proprio(alvo, k).filter(|d| d.attrs & attr::CONFIGURAVEL == 0) {
+                    let fixo = !d.acessor() && d.attrs & attr::GRAVAVEL == 0;
+                    if (fixo && !self.mesmo_valor(v, d.valor)) || (d.acessor() && d.set == Valor::UNDEFINED) {
+                        return self.erro_tipo("'set' on proxy: trap returned true for a non-writable target property");
+                    }
+                }
+                Ok(true)
             }
             None => {
                 let receptor = if receptor == p { alvo } else { receptor };
@@ -730,13 +793,43 @@ impl Motor {
         }
     }
 
+    /// CreateDataProperty num Proxy: a armadilha `defineProperty` com o descritor de dado padrão.
+    /// shortcut: sem as invariantes de §10.5.6 (alvo não configurável/não extensível); entra com
+    /// o resto das armadilhas de descritor.
+    fn proxy_criar_dado(&mut self, p: Valor, k: ChaveProp, v: Valor) -> Res<bool> {
+        self.checar_pilha()?;
+        let alvo = Valor(self.interno(p, 0));
+        match self.armadilha(p, "defineProperty")? {
+            Some((f, t)) => {
+                let kv = self.chave_para_valor(k);
+                let d = self.objeto_vazio();
+                self.definir_propria(d, fixos::VALUE, v, attr::PADRAO);
+                self.definir_propria(d, fixos::WRITABLE, Valor::TRUE, attr::PADRAO);
+                self.definir_propria(d, fixos::ENUMERABLE, Valor::TRUE, attr::PADRAO);
+                self.definir_propria(d, fixos::CONFIGURABLE, Valor::TRUE, attr::PADRAO);
+                let r = self.chamar(f, t, &[alvo, kv, d])?;
+                Ok(self.verdadeiro(r))
+            }
+            None => self.criar_dado(alvo, k, v),
+        }
+    }
+
     fn proxy_tem(&mut self, p: Valor, k: ChaveProp) -> Res<bool> {
+        self.checar_pilha()?;
         let alvo = Valor(self.interno(p, 0));
         match self.armadilha(p, "has")? {
             Some((f, t)) => {
                 let kv = self.chave_para_valor(k);
                 let r = self.chamar(f, t, &[alvo, kv])?;
-                Ok(self.verdadeiro(r))
+                if self.verdadeiro(r) {
+                    return Ok(true);
+                }
+                if let Some(d) = self.descritor_proprio(alvo, k) {
+                    if d.attrs & attr::CONFIGURAVEL == 0 || !self.formas.get(self.forma(alvo)).extensivel {
+                        return self.erro_tipo("'has' on proxy: trap returned false for a property the target fixes");
+                    }
+                }
+                Ok(false)
             }
             None => self.tem(alvo, k),
         }

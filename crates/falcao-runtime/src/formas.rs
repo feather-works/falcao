@@ -75,6 +75,8 @@ pub enum Classe {
     DataView,
     /// Iteradores nativos (de array, de mapa, de texto...).
     Iterador,
+    /// Helpers de `Iterator` (map, filter...) e o embrulho de `Iterator.from`.
+    IteradorAuxiliar,
     /// Namespace de módulo.
     Modulo,
 }
@@ -111,12 +113,12 @@ impl Classe {
             Classe::Argumentos => (1, 0b1),
             // [estado cru][quadro salvo (lista)][função]
             Classe::Gerador => (3, 0b110),
-            // [bytes][desligado cru]
-            Classe::ArrayBuffer => (2, 0b01),
-            // [buffer][tipo cru][deslocamento cru][comprimento cru]
+            // [bytes (undefined = desligado)][flags cru][tamanho máximo cru]
+            Classe::ArrayBuffer => (3, 0b001),
+            // [buffer][tipo cru][deslocamento cru][comprimento cru (u32::MAX = acompanha o buffer)]
             Classe::ArrayTipado | Classe::DataView => (4, 0b0001),
             // [alvo][índice cru][tipo cru]
-            Classe::Iterador => (3, 0b001),
+            Classe::Iterador | Classe::IteradorAuxiliar => (3, 0b001),
             Classe::Modulo => (1, 0b1),
         }
     }

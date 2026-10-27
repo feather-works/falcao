@@ -21,6 +21,10 @@ use crate::valor::Valor;
 pub const PERMANENTE: u32 = 64 * 1024;
 /// Tamanho do berçário (objetos novos).
 pub const BERCARIO: u32 = 4 * 1024 * 1024;
+/// Uso acima disto vira RangeError no próximo ponto seguro, antes que a gaiola chegue aos
+/// 4 GB (onde alocar dá pânico). shortcut: nativa que aloca em laço (sem ponto seguro) ainda
+/// pode chegar lá; upgrade: `alocar` devolver erro.
+pub const TETO: u64 = 3 << 30;
 /// Objeto maior que isto nasce direto na geração velha.
 pub const GRANDE: u32 = 64 * 1024;
 
@@ -31,6 +35,9 @@ pub struct Gaiola {
     pub bercario_inicio: u32,
     pub bercario_fim: u32,
     topo_bercario: u32,
+    /// Até onde `alocar` usa o berçário: o fim dele, ou o topo atual quando está em
+    /// [`Gaiola::direto_na_velha`].
+    teto_bercario: u32,
     pub velho_inicio: u32,
     topo_velho: u32,
     /// Campos de objetos velhos que apontam para o berçário (barreira de escrita).
@@ -39,6 +46,9 @@ pub struct Gaiola {
     pub coleta_pendente: bool,
     /// Bytes alocados na geração velha desde a última coleta completa.
     pub velho_desde_coleta: u64,
+    /// Passado disto em `velho_desde_coleta`, pede coleta: objeto grande (ArrayBuffer, texto
+    /// longo) vai direto para a velha e sozinho nunca enche o berçário.
+    pub gatilho_velho: u64,
 }
 
 #[inline(always)]
@@ -61,18 +71,25 @@ impl Gaiola {
             topo_permanente: 8,
             bercario_inicio: PERMANENTE,
             bercario_fim: PERMANENTE + BERCARIO,
+            teto_bercario: PERMANENTE + BERCARIO,
             topo_bercario: PERMANENTE,
             velho_inicio,
             topo_velho: velho_inicio,
             lembrados: Vec::new(),
             coleta_pendente: false,
             velho_desde_coleta: 0,
+            gatilho_velho: 32 << 20,
         }
     }
 
     /// Bytes em uso (berçário + velha), para o F12 e para decidir coletas.
     pub fn em_uso(&self) -> u64 {
         u64::from(self.topo_bercario - self.bercario_inicio) + u64::from(self.topo_velho - self.velho_inicio)
+    }
+
+    /// Ainda cabem `bytes` abaixo do [`TETO`].
+    pub fn cabe(&self, bytes: u64) -> bool {
+        self.em_uso() + bytes <= TETO
     }
 
     pub fn tamanho_reservado(&self) -> usize {
@@ -96,11 +113,11 @@ impl Gaiola {
     pub fn alocar(&mut self, bytes: u32) -> u32 {
         let b = arredondar(bytes);
         let d = self.topo_bercario;
-        if b < GRANDE && d + b <= self.bercario_fim {
+        if b < GRANDE && d + b <= self.teto_bercario {
             self.topo_bercario = d + b;
             return d;
         }
-        if b < GRANDE {
+        if b < GRANDE && self.teto_bercario == self.bercario_fim {
             self.coleta_pendente = true;
         }
         self.alocar_velho(b)
@@ -117,7 +134,17 @@ impl Gaiola {
         }
         self.topo_velho = fim;
         self.velho_desde_coleta += u64::from(b);
+        if self.velho_desde_coleta > self.gatilho_velho {
+            self.coleta_pendente = true;
+        }
         d
+    }
+
+    /// Liga ou desliga a alocação direto na geração velha (pré-alocação): para o que nasce em
+    /// massa e fica vivo de uma vez, como o resultado de um `JSON.parse` grande. Evita encher o
+    /// berçário e copiar tudo para a velha na coleta seguinte.
+    pub fn direto_na_velha(&mut self, sim: bool) {
+        self.teto_bercario = if sim { self.topo_bercario } else { self.bercario_fim };
     }
 
     /// Zera o berçário inteiro (depois de copiar os sobreviventes).

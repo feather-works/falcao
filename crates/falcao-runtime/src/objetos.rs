@@ -13,6 +13,7 @@
 use crate::formas::{attr, Chave, Classe, Descritor, FormaId, TipoElementos};
 use crate::motor::Motor;
 use crate::valor::Valor;
+use crate::nomes::fixos;
 
 /// Resultado de procurar uma propriedade na cadeia de protótipos.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -265,7 +266,7 @@ impl Motor {
         let cap = if el == Valor::LISTA_VAZIA { 0 } else { self.lista_len(el) };
         let forma = self.forma(obj);
         let f = self.formas.get(forma);
-        let (tipo, extensivel, e_array) = (f.elementos, f.extensivel, f.classe == Classe::Array);
+        let (tipo, extensivel, e_array, com_nomes) = (f.elementos, f.extensivel, f.classe == Classe::Array, f.n > 0);
         let existe = i < cap && self.lista_get(el, i) != Valor::BURACO;
         if !existe && !extensivel {
             return false;
@@ -283,8 +284,14 @@ impl Motor {
                 return true;
             }
         }
-        if i >= cap && i > cap.saturating_mul(2).saturating_add(1024) {
+        // `length` só leitura: nenhum item novo no fim (§10.4.2.1); o chamador lança ou ignora.
+        if e_array && com_nomes && !existe && i >= len && self.propria(obj, fixos::LENGTH).is_some() {
+            return false;
+        }
+        if i >= cap && i > cap.saturating_add(cap / 2).saturating_add(1024) {
             // Muito além do fim (`x[175237375] = 1`): vira propriedade com nome, sem esticar a lista.
+            // O limite é o do crescimento normal (1,5×): com 2× a lista dobrava a cada `x[2k-2]` e
+            // chegava a 2³¹ itens (8 GB) com 32 gravações.
             self.indices_especiais = true;
             let c = self.nome_do_indice(i);
             self.definir_propria(obj, c, v, attr::PADRAO);

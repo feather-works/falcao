@@ -3,7 +3,7 @@
 
 use crate::formas::{attr, Classe};
 use crate::funcoes::{Args, Res};
-use crate::interpretador::{Entrada, Fim};
+use crate::interpretador::{Entrada, Fim, RENDEU_CRU};
 use crate::intrinsecos::{simb, TipoErro};
 use crate::motor::Motor;
 use crate::nomes::fixos;
@@ -32,7 +32,8 @@ pub(super) fn instalar(m: &mut Motor) {
     let mut erro_ctor = Valor::UNDEFINED;
     for (i, nome) in nomes.iter().enumerate() {
         let id = m.registrar_nativa(nome, erro_construtor, true);
-        let ctor = m.nativa_com(id, 1, Valor::int(tipos[i] as i32));
+        let comp = if *nome == "AggregateError" { 2 } else { 1 };
+        let ctor = m.nativa_com(id, comp, Valor::int(tipos[i] as i32));
         let n = m.texto(nome);
         m.gravar_campo(ctor, 1, n);
         let p = m.intr.erro_protos[i];
@@ -43,6 +44,7 @@ pub(super) fn instalar(m: &mut Motor) {
         if i == 0 {
             erro_ctor = ctor;
             m.metodo(p, "toString", 0, erro_to_string);
+            m.metodo(ctor, "isError", 1, erro_is_error);
         } else {
             m.definir_proto(ctor, erro_ctor);
         }
@@ -125,6 +127,13 @@ fn has_instance(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     Ok(Valor::bool(m.instancia_comum(this, v)?))
 }
 
+/// `Error.isError` (ES2026): verdadeiro se o argumento tem o slot de erro.
+fn erro_is_error(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    let v = m.arg(a, 0);
+    let e = m.e_objeto(v) && m.formas.get(m.forma(v)).classe == Classe::Erro;
+    Ok(if e { Valor::TRUE } else { Valor::FALSE })
+}
+
 fn devolve_this(_m: &mut Motor, this: Valor, _a: Args, _nt: Valor) -> Res<Valor> {
     Ok(this)
 }
@@ -200,7 +209,7 @@ fn erro_construtor(m: &mut Motor, _this: Valor, a: Args, nt: Valor) -> Res<Valor
     }
     let pilha = m.texto_da_pilha();
     let cab = erro_to_string(m, e, Args { base: 0, n: 0 }, Valor::UNDEFINED)?;
-    let s = m.concatenar(cab, pilha);
+    let s = m.concatenar(cab, pilha)?;
     m.definir_propria(e, fixos::STACK, s, attr::METODO);
     Ok(e)
 }
@@ -220,17 +229,17 @@ fn erro_to_string(m: &mut Motor, this: Valor, _a: Args, _nt: Valor) -> Res<Valor
         return Ok(n);
     }
     let sep = m.texto(": ");
-    let a = m.concatenar(n, sep);
-    Ok(m.concatenar(a, msg))
+    let a = m.concatenar(n, sep)?;
+    m.concatenar(a, msg)
 }
 
 // ---------------------------------------------------------------- iterador de array
 
-const IT_VALORES: u32 = 0;
-const IT_CHAVES: u32 = 1;
-const IT_PARES: u32 = 2;
+pub(crate) const IT_VALORES: u32 = 0;
+pub(crate) const IT_CHAVES: u32 = 1;
+pub(crate) const IT_PARES: u32 = 2;
 
-fn novo_iterador_array(m: &mut Motor, this: Valor, tipo: u32) -> Res<Valor> {
+pub(crate) fn novo_iterador_array(m: &mut Motor, this: Valor, tipo: u32) -> Res<Valor> {
     let o = m.para_objeto(this)?;
     let p = m.intr.array_iterador_proto;
     let f = m.forma_para(Classe::Iterador, p, 0);
@@ -262,7 +271,15 @@ fn array_iterador_next(m: &mut Motor, this: Valor, _a: Args, _nt: Valor) -> Res<
         return Ok(m.resultado_iterador(Valor::UNDEFINED, true));
     }
     let i = m.interno(this, 1);
-    let n = m.comprimento_de(alvo)?;
+    let n = if m.formas.get(m.forma(alvo)).classe == Classe::ArrayTipado {
+        // Array tipado: o comprimento de dentro, e erro se o buffer sumiu ou encolheu demais.
+        match m.tipado_medir(alvo) {
+            Some(n) => u64::from(n),
+            None => return m.erro_tipo("Cannot perform %ArrayIteratorPrototype%.next on a detached or out-of-bounds TypedArray"),
+        }
+    } else {
+        m.comprimento_de(alvo)?
+    };
     if u64::from(i) >= n {
         m.por_interno_valor(this, 0, Valor::UNDEFINED);
         return Ok(m.resultado_iterador(Valor::UNDEFINED, true));
@@ -283,7 +300,7 @@ fn array_iterador_next(m: &mut Motor, this: Valor, _a: Args, _nt: Valor) -> Res<
 // ---------------------------------------------------------------- geradores
 
 fn gerador_retomar(m: &mut Motor, this: Valor, ent: Entrada) -> Res<Valor> {
-    if !m.e_objeto(this) || m.formas.get(m.forma(this)).classe != Classe::Gerador {
+    if !m.e_objeto(this) || m.formas.get(m.forma(this)).classe != Classe::Gerador || m.e_gerador_async(this) {
         return m.erro_tipo("next method called on incompatible receiver");
     }
     let id = m.interno(this, 0);
@@ -295,7 +312,11 @@ fn gerador_retomar(m: &mut Motor, this: Valor, ent: Entrada) -> Res<Valor> {
         };
     }
     match m.retomar(id, ent) {
-        Ok(Fim::Suspenso(v)) => Ok(m.resultado_iterador(v, false)),
+        Ok(Fim::Suspenso(v)) => {
+            // `yield*`: o resultado do iterador de dentro sai como veio.
+            let cru = m.suspensos[id as usize].as_ref().is_some_and(|s| s.modo == RENDEU_CRU);
+            Ok(if cru { v } else { m.resultado_iterador(v, false) })
+        }
         Ok(Fim::Retorno(v)) => {
             m.liberar_suspenso(id);
             m.por_interno(this, 0, u32::MAX);

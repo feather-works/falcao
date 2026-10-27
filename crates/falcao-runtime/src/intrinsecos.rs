@@ -58,22 +58,43 @@ pub struct Intrinsecos {
     pub bigint_proto: Valor,
     pub erro_protos: [Valor; 8],
     pub iterador_proto: Valor,
+    pub iterador_helper_proto: Valor,
+    pub wrap_iterador_proto: Valor,
     pub array_buffer_proto: Valor,
     /// Protótipos de Int8Array…Float64Array, na ordem de `builtins::tipados::TIPOS`.
-    pub tipados_protos: [Valor; 9],
+    pub tipados_protos: [Valor; 12],
+    /// Os construtores originais (Int8Array…), na mesma ordem.
+    pub tipados_ctors: [Valor; 12],
+    pub shared_array_buffer_proto: Valor,
+    /// Esperas de `Atomics.waitAsync`: array de trincas [buffer, byte, promessa].
+    pub atomics_esperas: Valor,
     pub array_iterador_proto: Valor,
     pub gerador_funcao_proto: Valor,
     pub gerador_proto: Valor,
+    /// %AsyncFunction.prototype%, %AsyncGeneratorFunction.prototype%, %AsyncGeneratorPrototype%,
+    /// %AsyncIteratorPrototype% e %AsyncFromSyncIteratorPrototype%.
+    pub async_funcao_proto: Valor,
+    pub async_gerador_funcao_proto: Valor,
+    pub async_gerador_proto: Valor,
+    pub async_iterador_proto: Valor,
+    pub async_de_sync_proto: Valor,
     pub forma_objeto: FormaId,
     pub forma_objeto_vazio: FormaId,
     pub forma_array: FormaId,
     pub forma_funcao: FormaId,
     pub forma_funcao_simples: FormaId,
     pub forma_funcao_gerador: FormaId,
+    pub forma_funcao_gerador_async: FormaId,
+    pub forma_funcao_async: FormaId,
     pub forma_objeto_gerador: FormaId,
+    pub forma_objeto_gerador_async: FormaId,
     pub formas_erro: [FormaId; 8],
     pub forma_argumentos: FormaId,
     pub promessa_proto: Valor,
+    /// %Promise% (o construtor original).
+    pub promessa_ctor: Valor,
+    /// As partes de Promise escritas em JS (lista de funções), feitas no primeiro uso.
+    pub promessa_js: Valor,
     pub regex_proto: Valor,
     pub regex_exec: Valor,
     pub eval: Valor,
@@ -84,7 +105,6 @@ pub struct Intrinsecos {
     pub nativa_classe_derivada: u32,
     pub nativa_resolver: u32,
     pub nativa_rejeitar: u32,
-    pub nativa_todos: u32,
 }
 
 impl Intrinsecos {
@@ -102,23 +122,38 @@ impl Intrinsecos {
             booleano_proto: u,
             simbolo_proto: u,
             array_buffer_proto: u,
-            tipados_protos: [u; 9],
+            tipados_protos: [u; 12],
+            tipados_ctors: [u; 12],
+            shared_array_buffer_proto: u,
+            atomics_esperas: u,
             bigint_proto: u,
             erro_protos: [u; 8],
             iterador_proto: u,
+            iterador_helper_proto: u,
+            wrap_iterador_proto: u,
             array_iterador_proto: u,
             gerador_funcao_proto: u,
             gerador_proto: u,
+            async_funcao_proto: u,
+            async_gerador_funcao_proto: u,
+            async_gerador_proto: u,
+            async_iterador_proto: u,
+            async_de_sync_proto: u,
             forma_objeto: f,
             forma_objeto_vazio: f,
             forma_array: f,
             forma_funcao: f,
             forma_funcao_simples: f,
             forma_funcao_gerador: f,
+            forma_funcao_gerador_async: f,
+            forma_funcao_async: f,
             forma_objeto_gerador: f,
+            forma_objeto_gerador_async: f,
             formas_erro: [f; 8],
             forma_argumentos: f,
             promessa_proto: u,
+            promessa_ctor: u,
+            promessa_js: u,
             regex_proto: u,
             regex_exec: u,
             eval: u,
@@ -129,7 +164,6 @@ impl Intrinsecos {
             nativa_classe_derivada: 0,
             nativa_resolver: 0,
             nativa_rejeitar: 0,
-            nativa_todos: 0,
         }
     }
 
@@ -146,10 +180,19 @@ impl Intrinsecos {
             &mut self.simbolo_proto,
             &mut self.bigint_proto,
             &mut self.iterador_proto,
+            &mut self.iterador_helper_proto,
+            &mut self.wrap_iterador_proto,
             &mut self.array_iterador_proto,
             &mut self.gerador_funcao_proto,
             &mut self.gerador_proto,
+            &mut self.async_funcao_proto,
+            &mut self.async_gerador_funcao_proto,
+            &mut self.async_gerador_proto,
+            &mut self.async_iterador_proto,
+            &mut self.async_de_sync_proto,
             &mut self.promessa_proto,
+            &mut self.promessa_ctor,
+            &mut self.promessa_js,
             &mut self.regex_proto,
             &mut self.regex_exec,
             &mut self.eval,
@@ -158,8 +201,11 @@ impl Intrinsecos {
             &mut self.funcao_has_instance,
         ];
         v.push(&mut self.array_buffer_proto);
+        v.push(&mut self.shared_array_buffer_proto);
+        v.push(&mut self.atomics_esperas);
         v.extend(self.erro_protos.iter_mut());
         v.extend(self.tipados_protos.iter_mut());
+        v.extend(self.tipados_ctors.iter_mut());
         v
     }
 }
@@ -252,7 +298,26 @@ impl Motor {
         let a = self.formas.adicionar(gbase, fixos::LENGTH, comp, h_len);
         let b = self.formas.adicionar(a, fixos::NAME, comp, h_nome);
         self.intr.forma_funcao_gerador = self.formas.adicionar(b, fixos::PROTOTYPE, attr::GRAVAVEL | attr::PREGUICOSO, h_proto);
-        self.intr.forma_objeto_gerador = self.forma_para(Classe::Gerador, gp, 0);
+        // O `prototype` de uma função geradora é objeto comum (não um gerador sem quadro).
+        self.intr.forma_objeto_gerador = self.forma_para(Classe::Comum, gp, 0);
+        // Async: funções, geradores e iteradores.
+        let aip = self.prototipo(Classe::Comum, op);
+        self.intr.async_iterador_proto = aip;
+        self.intr.async_de_sync_proto = self.prototipo(Classe::Comum, aip);
+        let afp = self.prototipo(Classe::Comum, fp);
+        self.intr.async_funcao_proto = afp;
+        let abase = self.forma_para(Classe::Funcao, afp, 3);
+        let a = self.formas.adicionar(abase, fixos::LENGTH, comp, h_len);
+        self.intr.forma_funcao_async = self.formas.adicionar(a, fixos::NAME, comp, h_nome);
+        let agfp = self.prototipo(Classe::Comum, fp);
+        self.intr.async_gerador_funcao_proto = agfp;
+        let agp = self.prototipo(Classe::Comum, aip);
+        self.intr.async_gerador_proto = agp;
+        let agbase = self.forma_para(Classe::Funcao, agfp, 3);
+        let a = self.formas.adicionar(agbase, fixos::LENGTH, comp, h_len);
+        let b = self.formas.adicionar(a, fixos::NAME, comp, h_nome);
+        self.intr.forma_funcao_gerador_async = self.formas.adicionar(b, fixos::PROTOTYPE, attr::GRAVAVEL | attr::PREGUICOSO, h_proto);
+        self.intr.forma_objeto_gerador_async = self.forma_para(Classe::Comum, agp, 0);
         self.intr.forma_argumentos = self.forma_para(Classe::Argumentos, op, 0);
         // Objeto global.
         let gforma = self.forma_para(Classe::Comum, op, 0);

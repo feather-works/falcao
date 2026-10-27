@@ -24,8 +24,10 @@ impl<'a> Analisador<'a> {
     /// rascunho a partir de `base`; devolve se ligou o modo estrito.
     fn diretivas(&mut self, base: usize) -> R<bool> {
         let mut ligou = false;
+        let mut octal = false;
         while self.atual.tipo == Tipo::Texto {
             let s = self.atual;
+            octal |= s.escapado;
             let c = self.item()?;
             self.rascunho.push(c);
             let No::Expressao(e) = *self.arv.no(c) else { break };
@@ -34,6 +36,9 @@ impl<'a> Analisador<'a> {
             }
             if let Dado::Faixa(a, b) = s.dado {
                 if &self.lex.fonte()[a as usize..b as usize] == "use strict" {
+                    if octal {
+                        return self.erro(s.inicio, "escape octal antes de \"use strict\"");
+                    }
                     self.ctx.estrito = true;
                     ligou = true;
                 }
@@ -47,7 +52,12 @@ impl<'a> Analisador<'a> {
 
     /// `StatementListItem`: comando ou declaração.
     pub(crate) fn item(&mut self) -> R<NoId> {
+        self.fundo(Self::item_nivel)
+    }
+
+    fn item_nivel(&mut self) -> R<NoId> {
         let pos = self.atual.inicio;
+        self.item_em = pos;
         if self.atual.tipo == Tipo::Nome && !self.atual.escapado {
             match self.atomo() {
                 Some(p::FUNCTION) => return self.decl_funcao(false, pos, false),
@@ -84,6 +94,10 @@ impl<'a> Analisador<'a> {
     }
 
     pub(crate) fn comando(&mut self) -> R<NoId> {
+        self.fundo(Self::comando_nivel)
+    }
+
+    fn comando_nivel(&mut self) -> R<NoId> {
         let pos = self.atual.inicio;
         match self.atual.tipo {
             Tipo::Pont(Pont::AbreChave) => return self.bloco(),
@@ -146,7 +160,7 @@ impl<'a> Analisador<'a> {
                 Ok(self.no(if continua { No::Continue(rotulo) } else { No::Break(rotulo) }, pos))
             }
             p::RETURN => {
-                if !self.ctx.em_funcao {
+                if !self.ctx.em_funcao || self.ctx.sem_return {
                     return self.erro_aqui("return fora de função");
                 }
                 self.avancar()?;
@@ -164,7 +178,7 @@ impl<'a> Analisador<'a> {
                 }
                 self.avancar()?;
                 let obj = self.cond_entre_parenteses()?;
-                let corpo = self.corpo_sub()?;
+                let corpo = self.comando()?;
                 self.marcar_funcao(|f| f.eval_direto = true);
                 Ok(self.no(No::Com { obj, corpo }, pos))
             }
@@ -184,8 +198,6 @@ impl<'a> Analisador<'a> {
                 self.fim_comando()?;
                 Ok(self.no(No::Depurador, pos))
             }
-            // Anexo B: `if (x) function f(){}` no modo não estrito.
-            p::FUNCTION if !self.ctx.estrito => self.decl_funcao(false, pos, false),
             p::FUNCTION | p::CLASS => self.erro_aqui("declaração não pode ser corpo de comando"),
             p::CONST => self.erro_aqui("declaração não pode ser corpo de comando"),
             p::IMPORT => {
@@ -204,6 +216,14 @@ impl<'a> Analisador<'a> {
     /// Comando de expressão ou rótulo (`nome: comando`).
     fn comando_expressao(&mut self) -> R<NoId> {
         let pos = self.atual.inicio;
+        // Um comando de expressão não começa com `async function` nem `let [` (§14.5).
+        if (self.palavra(p::ASYNC) || self.palavra(p::LET)) && !self.atual.escapado {
+            let prox = self.espiar()?;
+            let async_fn = self.palavra(p::ASYNC) && prox.tipo == Tipo::Nome && prox.dado == Dado::Atomo(p::FUNCTION) && !prox.quebra_antes;
+            if async_fn || (self.palavra(p::LET) && prox.tipo == Tipo::Pont(Pont::AbreColchete)) {
+                return self.erro_aqui("declaração não pode ser corpo de comando");
+            }
+        }
         let e = self.expressao_fechada()?;
         if self.e(Pont::DoisPontos) {
             if let No::Nome(r) = *self.arv.no(e) {
@@ -214,10 +234,19 @@ impl<'a> Analisador<'a> {
                     }
                     let e_laco = self.palavra(p::FOR) || self.palavra(p::WHILE) || self.palavra(p::DO);
                     self.rotulos.push((r, e_laco));
-                    let corpo = if self.palavra(p::FUNCTION) && !self.ctx.estrito {
+                    let solto = pos == self.item_em;
+                    let corpo = if self.palavra(p::FUNCTION) && !self.ctx.estrito && solto {
                         let fp = self.atual.inicio;
-                        self.decl_funcao(false, fp, false)
+                        let d = self.decl_funcao(false, fp, false)?;
+                        if matches!(*self.arv.no(d), No::DeclFuncao(f) if self.arv.funcao(f).flags.gerador) {
+                            return self.erro(fp, "gerador não pode ser rotulado");
+                        }
+                        Ok(d)
                     } else {
+                        if solto {
+                            // `a: b: function f(){}` também vale.
+                            self.item_em = self.atual.inicio;
+                        }
                         self.comando()
                     };
                     self.rotulos.pop();
@@ -255,6 +284,20 @@ impl<'a> Analisador<'a> {
 
     /// Corpo de `if`/`with`/rótulo: comando simples.
     fn corpo_sub(&mut self) -> R<NoId> {
+        // Anexo B.3.4: `if (x) function f(){}` no modo não estrito vale como `{ function f(){} }`.
+        if self.palavra(p::FUNCTION) && !self.ctx.estrito {
+            let pos = self.atual.inicio;
+            let d = self.decl_funcao(false, pos, false)?;
+            if let No::DeclFuncao(f) = *self.arv.no(d) {
+                if self.arv.funcao(f).flags.gerador {
+                    return self.erro(pos, "gerador não pode ser corpo de if");
+                }
+            }
+            let base = self.rascunho.len();
+            self.rascunho.push(d);
+            let l = self.lista(base);
+            return Ok(self.no(No::Bloco(l), pos));
+        }
         self.comando()
     }
 
@@ -342,6 +385,7 @@ impl<'a> Analisador<'a> {
         // Início: vazio, declaração ou expressão (com `in` desligado).
         let mut inicio = NoId::NADA;
         let mut decl = false;
+        let cabeca_escapada = self.atual.escapado;
         if !self.e(Pont::PontoVirgula) {
             let sem_in = self.ctx.sem_in;
             self.ctx.sem_in = true;
@@ -379,11 +423,19 @@ impl<'a> Analisador<'a> {
         if self.palavra(p::OF) || self.palavra(p::IN) {
             let de = self.palavra(p::OF);
             if decl {
-                if let No::Var { decls, .. } = *self.arv.no(inicio) {
+                if let No::Var { tipo, decls } = *self.arv.no(inicio) {
                     if decls.len != 1 {
                         return self.erro_aqui("for-in/of com mais de um declarador");
                     }
+                    // Valor inicial só no Anexo B.3.5: `for (var x = 0 in o)`, não estrito.
+                    if let No::Declarador { alvo, valor } = *self.arv.no(self.arv.lista(decls)[0]) {
+                        if valor.existe() && (de || tipo != TipoVar::Var || self.ctx.estrito || !matches!(self.arv.no(alvo), No::Nome(_))) {
+                            return self.erro_aqui("for-in/of com valor inicial");
+                        }
+                    }
                 }
+            } else if de && !cabeca_escapada && (matches!(self.arv.no(inicio), No::Nome(p::LET)) || (!aguarda && matches!(self.arv.no(inicio), No::Nome(p::ASYNC)))) {
+                return self.erro_aqui("for-of não começa com let/async");
             }
             self.avancar()?;
             let dir = if de { self.atribuicao_dentro_pub()? } else { self.expressao_dentro()? };
@@ -518,7 +570,11 @@ impl<'a> Analisador<'a> {
         self.ctx.sem_in = false;
         self.ctx.em_campo = false;
         self.ctx.em_funcao = true;
+        self.ctx.sem_return = false;
+        // Só os parâmetros de seta (lidos antes daqui) herdam a proibição de `await` do bloco static.
+        self.ctx.sem_await = false;
         if !flags.seta {
+            self.ctx.sem_arguments = false;
             self.ctx.assincrona = flags.assincrona;
             self.ctx.gerador = flags.gerador;
             self.ctx.new_target = true;
@@ -542,6 +598,14 @@ impl<'a> Analisador<'a> {
 
     /// `( parâmetros )`. Devolve a lista e se são todos nomes simples.
     pub(crate) fn parametros(&mut self) -> R<(Lista, bool)> {
+        let campo = std::mem::replace(&mut self.ctx.em_campo, true);
+        let r = self.parametros_dentro();
+        self.ctx.em_campo = campo;
+        r
+    }
+
+    /// Os parâmetros, com `yield`/`await` proibidos (como em inicializador de campo).
+    fn parametros_dentro(&mut self) -> R<(Lista, bool)> {
         self.esperar(Pont::AbreParen)?;
         let base = self.rascunho.len();
         let mut simples = true;
@@ -585,8 +649,18 @@ impl<'a> Analisador<'a> {
         self.esperar(Pont::AbreChave)?;
         let base = self.rascunho.len();
         let estava = self.ctx.estrito;
-        if self.diretivas(base)? && !estava && !self.arv.funcoes[id.0 as usize].flags.parametros_simples {
-            return self.erro_aqui("\"use strict\" em função com parâmetros não simples");
+        if self.diretivas(base)? {
+            if !self.arv.funcoes[id.0 as usize].flags.parametros_simples {
+                return self.erro_aqui("\"use strict\" em função com parâmetros não simples");
+            }
+            if !estava {
+                // O corpo estrito vale para trás: nome e parâmetros não podem ser eval/arguments.
+                let f = &self.arv.funcoes[id.0 as usize];
+                let proibido = |a: Option<Atomo>| matches!(a, Some(p::EVAL | p::ARGUMENTS));
+                if proibido(f.nome) || self.arv.lista(f.params).iter().any(|&x| matches!(*self.arv.no(x), No::Nome(a) if proibido(Some(a)))) {
+                    return self.erro_aqui("eval/arguments como nome no modo estrito");
+                }
+            }
         }
         while !self.e(Pont::FechaChave) {
             if self.atual.tipo == Tipo::Fim {
@@ -625,6 +699,7 @@ impl<'a> Analisador<'a> {
                 let ctx = self.ctx;
                 self.ctx.gerador = gerador;
                 self.ctx.assincrona = assincrona;
+                self.ctx.sem_await = false;
                 let r = self.checar_vinculo(a, np);
                 self.ctx = ctx;
                 r?;
@@ -744,6 +819,7 @@ impl<'a> Analisador<'a> {
         self.esperar(Pont::AbreChave)?;
         let em_classe = self.ctx.em_classe;
         self.ctx.em_classe = true;
+        self.privados.push(Default::default());
         let mut membros = Vec::new();
         let mut construtor = None;
         while !self.e(Pont::FechaChave) {
@@ -753,7 +829,16 @@ impl<'a> Analisador<'a> {
             if self.atual.tipo == Tipo::Fim {
                 return self.erro_aqui("esperava } fechando a classe");
             }
+            let pos_m = self.atual.inicio;
             let m = self.membro_classe(derivada)?;
+            if let Chave::Privada(a) = m.chave {
+                let tipo = match m.tipo {
+                    TipoMembroClasse::Get => 1,
+                    TipoMembroClasse::Set => 2,
+                    _ => 0,
+                };
+                self.declarar_privado(a, tipo, m.estatico, pos_m)?;
+            }
             if m.tipo == TipoMembroClasse::Metodo && !m.estatico && self.e_construtor(&m.chave) {
                 if construtor.is_some() {
                     return self.erro(self.arv.posicao(m.valor), "dois constructor na classe");
@@ -766,15 +851,20 @@ impl<'a> Analisador<'a> {
         }
         self.avancar()?;
         self.ctx.em_classe = em_classe;
+        self.fechar_privados()?;
         let id = ClasseId(self.arv.classes.len() as u32);
         self.arv.classes.push(Classe { nome, heranca, construtor, membros, inicio, fim: self.fim_anterior });
         Ok(id)
     }
 
     fn e_construtor(&self, c: &Chave) -> bool {
+        self.chave_fixa_e(c, p::CONSTRUCTOR, "constructor")
+    }
+
+    fn chave_fixa_e(&self, c: &Chave, atomo: Atomo, texto: &str) -> bool {
         match c {
-            Chave::Atomo(a) => *a == p::CONSTRUCTOR,
-            Chave::Texto(TextoRef::Faixa(a, b)) => &self.lex.fonte()[*a as usize..*b as usize] == "constructor",
+            Chave::Atomo(a) => *a == atomo,
+            Chave::Texto(TextoRef::Faixa(a, b)) => &self.lex.fonte()[*a as usize..*b as usize] == texto,
             _ => false,
         }
     }
@@ -798,6 +888,9 @@ impl<'a> Analisador<'a> {
                 let (id, pai, ctx, rotulos) = self.entrar_funcao(None, flags, pos);
                 self.ctx.em_funcao = true;
                 self.ctx.em_campo = true;
+                self.ctx.sem_arguments = true;
+                self.ctx.sem_return = true;
+                self.ctx.sem_await = true;
                 let r = self.corpo_bloco_estatico(id);
                 self.sair_funcao(id, pai, ctx, rotulos);
                 r?;
@@ -817,6 +910,8 @@ impl<'a> Analisador<'a> {
             if matches!(a, Some(p::ASYNC | p::GET | p::SET | p::ACCESSOR)) {
                 let prox = self.espiar()?;
                 let vem = !matches!(prox.tipo, Tipo::Pont(Pont::AbreParen | Pont::Atrib | Pont::PontoVirgula | Pont::FechaChave)) && prox.tipo != Tipo::Fim;
+                // `get` + quebra + `*a(){}`: `get *` não é acessor, então a ASI fecha o campo `get`.
+                let vem = vem && !(prox.quebra_antes && prox.tipo == Tipo::Pont(Pont::Vezes));
                 if vem && !prox.quebra_antes || vem && a != Some(p::ASYNC) && a != Some(p::ACCESSOR) {
                     self.avancar()?;
                     match a {
@@ -833,6 +928,9 @@ impl<'a> Analisador<'a> {
             gerador = true;
         }
         let chave = self.chave()?;
+        if estatico && self.chave_fixa_e(&chave, p::PROTOTYPE, "prototype") {
+            return self.erro(pos, "membro estático chamado prototype");
+        }
         if self.e(Pont::AbreParen) && tipo != TipoMembroClasse::Acessor {
             let construtor = !estatico && self.e_construtor(&chave);
             if construtor && (assincrona || gerador || tipo != TipoMembroClasse::Metodo) {
@@ -853,6 +951,7 @@ impl<'a> Analisador<'a> {
             let flags = FlagsFuncao { metodo: true, seta: false, parametros_simples: true, ..FlagsFuncao::default() };
             let (id, pai, ctx, rotulos) = self.entrar_funcao(None, flags, pos);
             self.ctx.em_campo = true;
+            self.ctx.sem_arguments = true;
             let ep = self.atual.inicio;
             let r = self.atribuicao_fechada();
             let r = r.map(|e| {
@@ -1124,5 +1223,20 @@ mod testes {
         assert!(a.funcoes[0].flags.usa_this && a.funcoes[0].flags.usa_arguments);
         assert!(!a.funcoes[0].flags.eval_direto && a.funcoes[2].flags.eval_direto);
         assert!(!a.funcoes[2].flags.parametros_simples);
+    }
+
+    #[test]
+    fn erros_antecipados() {
+        for f in ["while (0) async function f(){}", "if (1) let [a] = 0", "while (0) l: function f(){}", "l: function* g(){}",
+            "for (let a = 0 of []) ;", "for (var [a] = 0 in {}) ;", "function* g(a = yield) {}", "class C { static { return } }",
+            "class C { static { var await } }", "class C { static prototype(){} }", "function f(a = 1) { 'use strict' }",
+            "function eval() { 'use strict' }", "function f() { '\\07'; 'use strict' }", "[...a,] = []", "f() &&= 1", "0_1",
+            "({ __proto__: 1, '__proto__': 2 })", "'use strict'; delete ((a))"] {
+            falha(f);
+        }
+        for f in ["l: function f(){}", "a: b: function f(){}", "if (1) function f(){}", "for (var a = 0 in {}) ;", "async function f() { for await (async of []) ; }",
+            "class C { static { (function await(){}) } }", "({ __proto__: a, '__proto__': b } = {})", "class C { get\n*a(){} }"] {
+            ok(f);
+        }
     }
 }

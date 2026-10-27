@@ -507,11 +507,17 @@ impl<'a> Lexico<'a> {
             return self.fim_de_numero(ini);
         }
         // Octal legado (`017`) e decimal com zero à esquerda (`08`): só fora do modo estrito.
+        if c0 == b'0' && self.olhar(1) == b'_' {
+            return self.erro(self.pos + 1, "separador _ depois de zero à esquerda");
+        }
         if c0 == b'0' && self.olhar(1).is_ascii_digit() {
             s.escapado = true;
             while self.olhar(0).is_ascii_digit() {
                 texto.push(self.olhar(0) as char);
                 self.pos += 1;
+            }
+            if self.olhar(0) == b'_' {
+                return self.erro(self.pos, "separador _ em octal legado");
             }
             if texto.bytes().all(|d| d < b'8') {
                 s.dado = Dado::Numero(numeros::inteiro(&texto, 8));
@@ -565,6 +571,11 @@ impl<'a> Lexico<'a> {
 
     fn bigint(&mut self, s: &mut Simbolo, digitos: &str, base: u32) -> R<()> {
         s.tipo = Tipo::BigInt;
+        // A conversão é quadrática: literal maior que o maior BigInt travaria a carga.
+        let bits = digitos.trim_start_matches('0').len() as u64 * u64::from(base.ilog2() + u32::from(base == 10));
+        if bits > BIGINT_MAX_BITS {
+            return self.erro(s.inicio as usize, "BigInt grande demais");
+        }
         let decimal = if base == 10 { digitos.trim_start_matches('0').to_string() } else { bigint_para_decimal(digitos, base) };
         let decimal = if decimal.is_empty() { "0".to_string() } else { decimal };
         self.textos.push(decimal.encode_utf16().collect());
@@ -868,7 +879,10 @@ fn empurrar_cru(cru: &mut Vec<u16>, texto: &str) {
     }
 }
 
-/// Dígitos em base 2/8/16 → texto decimal (BigInt sem limite de tamanho).
+/// Maior BigInt literal, em bits: o mesmo `MAX_BITS` do runtime (`grande.rs`).
+const BIGINT_MAX_BITS: u64 = 1 << 20;
+
+/// Dígitos em base 2/8/16 → texto decimal.
 fn bigint_para_decimal(digitos: &str, base: u32) -> String {
     // Em "membros" de 10^9, do menos significativo para o mais.
     let mut membros: Vec<u32> = vec![0];

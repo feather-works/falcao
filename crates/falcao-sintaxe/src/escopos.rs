@@ -51,6 +51,8 @@ pub enum TipoVinculo {
     NomeFuncao,
     /// `arguments` implícito.
     Arguments,
+    /// Nome privado `#x` de uma classe: um símbolo novo a cada avaliação da classe.
+    Privado,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +85,9 @@ pub enum Ref {
     Global,
     /// Busca por nome em tempo de execução (`with`/`eval`), caindo no global.
     Dinamico,
+    /// Dentro de `with`, com o vínculo fora dele: os objetos de `with` no meio primeiro, depois
+    /// o vínculo (não o global).
+    Com(VinculoId),
 }
 
 /// Resultado da análise de escopos de uma [`Arvore`].
@@ -101,12 +106,19 @@ pub struct Escopos {
     pub escopo_da_classe: Vec<EscopoId>,
     /// Funções de bloco que também ganham `var` na função (Anexo B.3.3): nó → vínculo var.
     pub anexo_b: MapaRapido<u32, VinculoId>,
+    /// Nomes privados declarados: (escopo da classe, nome sem `#`) → vínculo. À parte dos nomes
+    /// comuns: `#x` e `x` não se enxergam.
+    pub privados: MapaRapido<(u32, Atomo), VinculoId>,
     pub raiz: Option<EscopoId>,
+    /// Erro antecipado de declaração (nome repetido, `let` contra `var`...): SyntaxError com o nome.
+    pub erro: Option<Atomo>,
 }
 
 const SEM_REF: u32 = u32::MAX;
 const REF_GLOBAL: u32 = u32::MAX - 1;
 const REF_DINAMICO: u32 = u32::MAX - 2;
+/// Marca de [`Ref::Com`] no número do vínculo.
+const BIT_COM: u32 = 1 << 31;
 
 impl Escopos {
     pub fn referencia(&self, no: NoId) -> Option<Ref> {
@@ -114,6 +126,7 @@ impl Escopos {
             SEM_REF => None,
             REF_GLOBAL => Some(Ref::Global),
             REF_DINAMICO => Some(Ref::Dinamico),
+            v if v & BIT_COM != 0 => Some(Ref::Com(VinculoId(v & !BIT_COM))),
             v => Some(Ref::Vinculo(VinculoId(v))),
         }
     }
@@ -136,6 +149,22 @@ struct Analise<'t> {
     pendentes: Vec<(NoId, EscopoId)>,
     /// Escopos onde há `eval(...)` direto.
     evals: Vec<EscopoId>,
+    /// Usos de `#x` (nó `MembroPrivado`/`NomePrivado`, nome, escopo de onde se procura).
+    pendentes_privados: Vec<(NoId, Atomo, EscopoId)>,
+    /// Lendo o `extends`: os nomes privados de lá são os da classe de fora.
+    privados_de: Option<EscopoId>,
+    /// `var` (ou função de topo) que atravessa um escopo de bloco até o da função: (escopo, nome).
+    var_por: MapaRapido<(u32, Atomo), ()>,
+    /// Vínculos que não pesam na checagem de repetição: `var` do Anexo B.3.3 e funções de bloco
+    /// comuns em modo não estrito (que podem se repetir entre si).
+    anexo: Vec<VinculoId>,
+    funcoes_soltas: Vec<VinculoId>,
+    /// Escopos de `catch` com padrão (`catch ([e])`): aí nem `var e` vale.
+    capturas_padrao: Vec<EscopoId>,
+    /// Declarando agora uma função de bloco comum, não estrita.
+    funcao_solta: bool,
+    /// Parâmetros que não podem se repetir (estrito, seta, método ou lista não simples).
+    params_unicos: bool,
 }
 
 /// Analisa os escopos de uma árvore inteira.
@@ -152,6 +181,14 @@ pub fn analisar_escopos(arv: &Arvore) -> Escopos {
         atual: EscopoId(0),
         pendentes: Vec::with_capacity(arv.nos.len() / 4),
         evals: Vec::new(),
+        pendentes_privados: Vec::new(),
+        privados_de: None,
+        var_por: MapaRapido::default(),
+        anexo: Vec::new(),
+        funcoes_soltas: Vec::new(),
+        capturas_padrao: Vec::new(),
+        funcao_solta: false,
+        params_unicos: false,
     };
     let raiz = a.abrir(if arv.modulo { TipoEscopo::Modulo } else { TipoEscopo::Script }, None);
     a.e.raiz = Some(raiz);
@@ -191,7 +228,86 @@ impl Analise<'_> {
         self.e.refs[no.0 as usize] = if self.e.escopos[escopo.0 as usize].tipo == TipoEscopo::Script { REF_GLOBAL } else { v.0 };
     }
 
+    fn erro(&mut self, nome: Atomo) {
+        self.e.erro.get_or_insert(nome);
+    }
+
+    /// Escopo onde moram `var`s (o de função, script ou módulo)?
+    fn e_de_var(&self, e: EscopoId) -> bool {
+        matches!(self.e.escopos[e.0 as usize].tipo, TipoEscopo::Funcao | TipoEscopo::Script | TipoEscopo::Modulo)
+    }
+
+    /// O vínculo `v` é léxico (let/const/class/import/função de bloco/catch com padrão)?
+    fn lexico(&self, v: VinculoId) -> bool {
+        let vin = self.e.vinculos[v.0 as usize];
+        match vin.tipo {
+            TipoVinculo::Let | TipoVinculo::Const | TipoVinculo::Classe | TipoVinculo::Import => true,
+            TipoVinculo::Funcao => !self.e_de_var(vin.escopo),
+            TipoVinculo::Captura => self.capturas_padrao.contains(&vin.escopo),
+            _ => false,
+        }
+    }
+
+    /// Erros antecipados de declaração (§8.2 LexicallyDeclaredNames × VarDeclaredNames, B.3.2–B.3.5).
+    fn checar(&mut self, escopo: EscopoId, nome: Atomo, tipo: TipoVinculo) {
+        let antigo = self.mapa.get(&(escopo.0, nome)).copied().filter(|v| !self.anexo.contains(v));
+        let lexico = match tipo {
+            TipoVinculo::Let | TipoVinculo::Const | TipoVinculo::Classe | TipoVinculo::Import => true,
+            TipoVinculo::Funcao => !self.e_de_var(escopo),
+            TipoVinculo::Var => false,
+            TipoVinculo::Param => {
+                if antigo.is_some() && self.params_unicos {
+                    self.erro(nome);
+                }
+                return;
+            }
+            TipoVinculo::Captura => {
+                if antigo.is_some() {
+                    self.erro(nome);
+                }
+                return;
+            }
+            _ => return,
+        };
+        if lexico {
+            if let Some(v) = antigo {
+                let soltas = self.funcao_solta && self.funcoes_soltas.contains(&v);
+                if !soltas {
+                    self.erro(nome);
+                }
+            }
+            if self.var_por.contains_key(&(escopo.0, nome)) {
+                self.erro(nome);
+            }
+            // `catch (e) { let e }`: o corpo do catch não pode repetir o parâmetro.
+            if let Some(pai) = self.e.escopos[escopo.0 as usize].pai {
+                if self.e.escopos[pai.0 as usize].tipo == TipoEscopo::Captura && self.mapa.contains_key(&(pai.0, nome)) {
+                    self.erro(nome);
+                }
+            }
+            return;
+        }
+        // `var` (ou função de topo): de onde está até o escopo da função, nada léxico com o nome.
+        let mut s = self.atual;
+        loop {
+            if let Some(&v) = self.mapa.get(&(s.0, nome)) {
+                if self.lexico(v) && !self.anexo.contains(&v) {
+                    self.erro(nome);
+                }
+            }
+            if s == escopo {
+                break;
+            }
+            self.var_por.insert((s.0, nome), ());
+            match self.e.escopos[s.0 as usize].pai {
+                Some(p) => s = p,
+                None => break,
+            }
+        }
+    }
+
     fn declarar(&mut self, escopo: EscopoId, nome: Atomo, tipo: TipoVinculo) -> VinculoId {
+        self.checar(escopo, nome, tipo);
         if let Some(&v) = self.mapa.get(&(escopo.0, nome)) {
             // `var x` repetido, `function f` + `var f`: o mesmo vínculo (a função ganha).
             if tipo == TipoVinculo::Funcao {
@@ -293,7 +409,12 @@ impl Analise<'_> {
             No::Funcao(f) => self.funcao(f),
             No::Classe(c) => self.classe(c, None),
             No::Espalhar(x) | No::Paren(x) | No::Await(x) | No::PadraoResto(x) | No::Expressao(x) | No::Lance(x) | No::CadeiaOpcional(x) => self.visitar(x),
-            No::Membro { obj, .. } | No::MembroPrivado { obj, .. } => self.visitar(obj),
+            No::Membro { obj, .. } => self.visitar(obj),
+            No::MembroPrivado { obj, prop, .. } => {
+                self.visitar(obj);
+                self.pendentes_privados.push((n, prop, self.privados_de.unwrap_or(self.atual)));
+            }
+            No::NomePrivado(a) => self.pendentes_privados.push((n, a, self.privados_de.unwrap_or(self.atual))),
             No::Indice { obj, prop, .. } => {
                 self.visitar(obj);
                 self.visitar(prop);
@@ -311,9 +432,18 @@ impl Analise<'_> {
             }
             No::Unario { arg, .. } => self.visitar(arg),
             No::Atualizacao { alvo, .. } => self.visitar(alvo),
-            No::Binario { esq, dir, .. } | No::Logico { esq, dir, .. } => {
-                self.visitar(esq);
-                self.visitar(dir);
+            No::Binario { .. } | No::Logico { .. } => {
+                // A espinha à esquerda num laço: cadeia longa de `+` não estoura a pilha.
+                let mut dirs = Vec::new();
+                let mut e = n;
+                while let No::Binario { esq, dir, .. } | No::Logico { esq, dir, .. } = *self.arv.no(e) {
+                    dirs.push(dir);
+                    e = esq;
+                }
+                self.visitar(e);
+                for d in dirs.into_iter().rev() {
+                    self.visitar(d);
+                }
             }
             No::Condicional { teste, sim, nao } | No::Se { teste, sim, nao } => {
                 self.visitar(teste);
@@ -371,6 +501,9 @@ impl Analise<'_> {
                     self.com_escopo(n, TipoEscopo::Captura, |a| {
                         if param.existe() {
                             let e = a.atual;
+                            if !matches!(a.arv.no(param), No::Nome(_)) {
+                                a.capturas_padrao.push(e);
+                            }
                             a.padrao(param, e, TipoVinculo::Captura);
                         }
                         a.visitar(captura);
@@ -385,12 +518,22 @@ impl Analise<'_> {
                         let v = self.declarar(var, nome, TipoVinculo::Funcao);
                         self.ligar(n, v);
                     } else {
+                        let fl = self.arv.funcao(f).flags;
+                        self.funcao_solta = !fl.estrita && !fl.assincrona && !fl.gerador;
                         let v = self.declarar(self.atual, nome, TipoVinculo::Funcao);
+                        if self.funcao_solta {
+                            self.funcoes_soltas.push(v);
+                        }
+                        self.funcao_solta = false;
                         self.ligar(n, v);
                         // Anexo B.3.3: no modo não estrito, a função de bloco também vira `var`.
                         let f_ = self.arv.funcao(f);
                         if !f_.flags.estrita && !f_.flags.assincrona && !f_.flags.gerador && !self.mapa.contains_key(&(var.0, nome)) {
-                            let vv = self.declarar(var, nome, TipoVinculo::Var);
+                            let vv = VinculoId(self.e.vinculos.len() as u32);
+                            self.e.vinculos.push(Vinculo { nome, tipo: TipoVinculo::Var, escopo: var, capturado: false });
+                            self.e.escopos[var.0 as usize].vinculos.push(vv);
+                            self.mapa.insert((var.0, nome), vv);
+                            self.anexo.push(vv);
                             self.e.anexo_b.insert(n.0, vv);
                         } else if let Some(&vv) = self.mapa.get(&(var.0, nome)) {
                             if !f_.flags.estrita && matches!(self.e.vinculos[vv.0 as usize].tipo, TipoVinculo::Var | TipoVinculo::Funcao) {
@@ -453,9 +596,12 @@ impl Analise<'_> {
         self.e.escopo_da_funcao[f.0 as usize] = e;
         // shortcut: `eval` direto roda como global (não vê nem cria locais), então não torna o
         // escopo dinâmico; quando o eval direto enxergar locais, marcar aqui e nomear os contextos.
+        let fl = func.flags;
+        let unicos = std::mem::replace(&mut self.params_unicos, fl.estrita || fl.seta || fl.metodo || !fl.parametros_simples);
         for &x in self.arv.lista(func.params) {
             self.padrao(x, e, TipoVinculo::Param);
         }
+        self.params_unicos = unicos;
         self.lista(func.corpo);
         self.atual = antes;
     }
@@ -469,7 +615,19 @@ impl Analise<'_> {
         if let Some(nome) = classe.nome {
             self.declarar(e, nome, TipoVinculo::Const);
         }
+        for m in &classe.membros {
+            if let Chave::Privada(a) = m.chave {
+                if !self.e.privados.contains_key(&(e.0, a)) {
+                    let v = VinculoId(self.e.vinculos.len() as u32);
+                    self.e.vinculos.push(Vinculo { nome: a, tipo: TipoVinculo::Privado, escopo: e, capturado: false });
+                    self.e.escopos[e.0 as usize].vinculos.push(v);
+                    self.e.privados.insert((e.0, a), v);
+                }
+            }
+        }
+        let fora = std::mem::replace(&mut self.privados_de, Some(antes));
         self.opc(classe.heranca);
+        self.privados_de = fora;
         if let Some(k) = classe.construtor {
             self.funcao(k);
         }
@@ -494,6 +652,20 @@ impl Analise<'_> {
             };
             let r = self.resolver_nome(nome, escopo);
             self.e.refs[no.0 as usize] = r;
+        }
+        for (no, nome, de) in std::mem::take(&mut self.pendentes_privados) {
+            let funcao_ref = self.e.escopos[de.0 as usize].funcao;
+            let mut e = Some(de);
+            while let Some(id) = e {
+                if let Some(&v) = self.e.privados.get(&(id.0, nome)) {
+                    if self.e.escopos[id.0 as usize].funcao != funcao_ref {
+                        self.e.vinculos[v.0 as usize].capturado = true;
+                    }
+                    self.e.refs[no.0 as usize] = v.0;
+                    break;
+                }
+                e = self.e.escopos[id.0 as usize].pai;
+            }
         }
         // Topo de módulo mora no contexto: é dele que as exportações são lidas.
         if self.arv.modulo {
@@ -524,7 +696,7 @@ impl Analise<'_> {
                 if esc.funcao != funcao_ref || dinamico {
                     self.e.vinculos[v.0 as usize].capturado = true;
                 }
-                return if dinamico { REF_DINAMICO } else { v.0 };
+                return if dinamico { v.0 | BIT_COM } else { v.0 };
             }
             // `arguments` implícito: nasce na primeira função não-seta da subida.
             if nome == p::ARGUMENTS && esc.tipo == TipoEscopo::Funcao {
@@ -534,7 +706,7 @@ impl Analise<'_> {
                     if self.e.escopos[e.0 as usize].funcao != funcao_ref || dinamico {
                         self.e.vinculos[v.0 as usize].capturado = true;
                     }
-                    return if dinamico { REF_DINAMICO } else { v.0 };
+                    return if dinamico { v.0 | BIT_COM } else { v.0 };
                 }
             }
             let (esc_dinamico, esc_pai) = (esc.dinamico, esc.pai);
@@ -609,5 +781,19 @@ mod testes {
         let Some(Ref::Vinculo(v)) = refs.iter().find(|(t, _)| t == "arguments").unwrap().1 else { panic!() };
         assert_eq!(e.vinculo(v).tipo, TipoVinculo::Arguments);
         assert!(e.vinculo(v).capturado);
+    }
+
+    #[test]
+    fn redeclaracoes() {
+        let erro = |f: &str| analisar_escopos(&analisar_script(f).unwrap().0).erro.is_some();
+        for f in ["let a; var a;", "{ var a; let a; }", "{ let a; { var a } }", "function f(a) { let a }", "'use strict'; function f(a, a) {}",
+            "(a, a) => 1", "try {} catch (e) { let e }", "try {} catch ([e]) { var e }", "switch (0) { case 1: let a; case 2: let a }",
+            "for (let a of []) { var a }", "'use strict'; { function f(){} function f(){} }", "{ function f(){} async function f(){} }"] {
+            assert!(erro(f), "devia falhar: {f}");
+        }
+        for f in ["var a; var a;", "function f(a, a) {}", "try {} catch (e) { var e }", "{ function f(){} function f(){} }",
+            "let f; { function f(){} }", "function g() { let f; if (1) function f(){} }", "var a; function a(){}"] {
+            assert!(!erro(f), "devia passar: {f}");
+        }
     }
 }

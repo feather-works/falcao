@@ -20,7 +20,7 @@ use crate::funcoes::{Args, FnNativa, Res};
 use crate::intrinsecos::simb;
 use crate::motor::Motor;
 use crate::nomes::fixos;
-use crate::textos::ChaveProp;
+use crate::textos::{ChaveProp, Unidades};
 use crate::valor::Valor;
 
 /// Chave de uma entrada pela igualdade SameValueZero.
@@ -38,13 +38,103 @@ pub enum ChaveTabela {
 /// Entradas de um Map/Set, em ordem de inserção. Apagadas ficam `None`.
 pub struct Tabela {
     pub itens: Vec<Option<(Valor, Valor)>>,
+    /// Números, BigInt, objetos e textos com unidade acima de 255.
     pub indice: HashMap<ChaveTabela, usize>,
+    /// Textos só com unidades até 255 (quase todas as chaves), pelos bytes: a busca lê os bytes
+    /// direto da gaiola, sem copiar o texto a cada `get`/`has`.
+    pub textos: HashMap<Bytes, usize>,
     pub vivos: usize,
 }
 
 impl Tabela {
     pub(crate) fn nova() -> Self {
-        Tabela { itens: Vec::new(), indice: HashMap::new(), vivos: 0 }
+        Tabela { itens: Vec::new(), indice: HashMap::new(), textos: HashMap::new(), vivos: 0 }
+    }
+}
+
+/// Bytes de uma chave de texto. As curtas (quase todas) moram na própria entrada da tabela:
+/// a busca não segue um ponteiro (uma falta de cache a menos) e nada vai para o `malloc`.
+#[derive(Clone)]
+pub enum Bytes {
+    Curta(u8, [u8; CURTA]),
+    Longa(Box<[u8]>),
+}
+
+const CURTA: usize = 22;
+
+impl Bytes {
+    fn de(b: &[u8]) -> Bytes {
+        if b.len() <= CURTA {
+            let mut a = [0; CURTA];
+            a[..b.len()].copy_from_slice(b);
+            Bytes::Curta(b.len() as u8, a)
+        } else {
+            Bytes::Longa(b.into())
+        }
+    }
+}
+
+impl std::borrow::Borrow<[u8]> for Bytes {
+    fn borrow(&self) -> &[u8] {
+        match self {
+            Bytes::Curta(n, a) => &a[..*n as usize],
+            Bytes::Longa(b) => b,
+        }
+    }
+}
+
+// Hash e igualdade pelos bytes, iguais aos de `[u8]`: a busca usa a fatia emprestada.
+impl std::hash::Hash for Bytes {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        std::borrow::Borrow::<[u8]>::borrow(self).hash(h)
+    }
+}
+
+impl PartialEq for Bytes {
+    fn eq(&self, o: &Bytes) -> bool {
+        std::borrow::Borrow::<[u8]>::borrow(self) == std::borrow::Borrow::<[u8]>::borrow(o)
+    }
+}
+
+impl Eq for Bytes {}
+
+/// Chave dona (para inserir ou apagar).
+enum Dona {
+    Bytes(Bytes),
+    Outra(ChaveTabela),
+}
+
+/// Unidades de texto até 255 como bytes; `None` se alguma passa (fica em `indice`).
+fn latin1(u: &[u16]) -> Option<Bytes> {
+    let b: Option<Vec<u8>> = u.iter().map(|&c| u8::try_from(c).ok()).collect();
+    b.map(|b| Bytes::de(&b))
+}
+
+fn chave_dona(m: &mut Motor, k: Valor) -> Dona {
+    if m.e_texto(k) {
+        let p = m.achatar(k);
+        return match m.unidades_planas(p) {
+            Unidades::Latin1(b) => Dona::Bytes(Bytes::de(b)),
+            Unidades::Utf16(u) => match latin1(u) {
+                Some(b) => Dona::Bytes(b),
+                None => Dona::Outra(ChaveTabela::Texto(u.to_vec())),
+            },
+        };
+    }
+    Dona::Outra(chave_tabela(m, k))
+}
+
+/// Posição da chave `k` na tabela, sem alocar quando ela é texto Latin1 já plano.
+fn achar(m: &mut Motor, idx: usize, k: Valor) -> Option<usize> {
+    if m.e_texto(k) {
+        let p = m.achatar(k);
+        if let Unidades::Latin1(b) = m.unidades_planas(p) {
+            return m.tabelas[idx].textos.get(b).copied();
+        }
+    }
+    match chave_dona(m, k) {
+        Dona::Bytes(b) => m.tabelas[idx].textos.get(&b).copied(),
+        Dona::Outra(ch) => m.tabelas[idx].indice.get(&ch).copied(),
     }
 }
 
@@ -215,22 +305,25 @@ fn sem_menos_zero(m: &Motor, k: Valor) -> Valor {
 
 fn inserir(m: &mut Motor, idx: usize, k: Valor, v: Valor) {
     let k = sem_menos_zero(m, k);
-    let ch = chave_tabela(m, k);
+    let dona = chave_dona(m, k);
     let t = &mut m.tabelas[idx];
-    match t.indice.get(&ch).copied() {
-        Some(p) => t.itens[p] = Some((k, v)),
-        None => {
-            t.itens.push(Some((k, v)));
-            t.indice.insert(ch, t.itens.len() - 1);
-            t.vivos += 1;
-        }
+    let novo = t.itens.len();
+    // Uma busca só: achou, troca o valor; não achou, a entrada já fica reservada.
+    let p = *match dona {
+        Dona::Bytes(b) => t.textos.entry(b).or_insert(novo),
+        Dona::Outra(ch) => t.indice.entry(ch).or_insert(novo),
+    };
+    if p == novo {
+        t.itens.push(Some((k, v)));
+        t.vivos += 1;
+    } else {
+        t.itens[p] = Some((k, v));
     }
 }
 
 fn ler(m: &mut Motor, idx: usize, k: Valor) -> Option<(Valor, Valor)> {
-    let ch = chave_tabela(m, k);
-    let t = &m.tabelas[idx];
-    t.indice.get(&ch).and_then(|&p| t.itens[p])
+    let p = achar(m, idx, k)?;
+    m.tabelas[idx].itens[p]
 }
 
 fn contem(m: &mut Motor, idx: usize, k: Valor) -> bool {
@@ -238,9 +331,13 @@ fn contem(m: &mut Motor, idx: usize, k: Valor) -> bool {
 }
 
 fn apagar(m: &mut Motor, idx: usize, k: Valor) -> bool {
-    let ch = chave_tabela(m, k);
+    let dona = chave_dona(m, k);
     let t = &mut m.tabelas[idx];
-    match t.indice.remove(&ch) {
+    let r = match dona {
+        Dona::Bytes(b) => t.textos.remove(&b),
+        Dona::Outra(ch) => t.indice.remove(&ch),
+    };
+    match r {
         Some(p) => {
             t.itens[p] = None;
             t.vivos -= 1;
@@ -256,6 +353,7 @@ fn limpar(m: &mut Motor, idx: usize) {
         *x = None;
     }
     t.indice.clear();
+    t.textos.clear();
     t.vivos = 0;
 }
 
@@ -301,6 +399,50 @@ fn tabela_de(m: &mut Motor, this: Valor, classes: &[Classe], nome: &str) -> Res<
     m.erro_tipo(&format!("Method {nome} called on incompatible receiver"))
 }
 
+/// `adder` é a nativa `f` original (não foi trocada)?
+fn e_nativa(m: &Motor, adder: Valor, f: FnNativa) -> bool {
+    use crate::funcoes::{BIT_NATIVA, F_CODIGO};
+    if !m.e_objeto(adder) || m.formas.get(m.forma(adder)).classe != Classe::Funcao {
+        return false;
+    }
+    let c = m.interno(adder, F_CODIGO);
+    c & BIT_NATIVA != 0 && std::ptr::fn_addr_eq(m.nativas[(c & !BIT_NATIVA) as usize].f, f)
+}
+
+/// AddEntriesFromIterable / o laço de `new Set(it)`: chama o `set`/`add` atual do objeto a cada
+/// item (`par`: item `[k, v]`) e fecha o iterador se algo lançar. Com o método original, insere
+/// direto (o mesmo efeito, sem a chamada).
+fn adicionar_de(m: &mut Motor, o: Valor, it: Valor, metodo: &str, original: FnNativa, par: bool, fraca: Option<&str>) -> Res<()> {
+    let k = m.chave(metodo);
+    let adder = m.obter(o, ChaveProp::Nome(k))?;
+    if !m.e_funcao(adder) {
+        return m.erro_tipo(&format!("'{metodo}' returned for property '{metodo}' of object is not a function"));
+    }
+    let direto = e_nativa(m, adder, original);
+    let idx = m.interno(o, 1) as usize;
+    let reg = m.obter_iterador(it)?;
+    while let Some(x) = m.proximo(reg)? {
+        let r = (|| {
+            let (k, v) = if par { par_de(m, x)? } else { (x, x) };
+            if !direto {
+                let args: &[Valor] = if par { &[k, v] } else { &[k] };
+                return m.chamar(adder, o, args).map(drop);
+            }
+            if let Some(msg) = fraca {
+                validar_fraca(m, k, msg)?;
+            }
+            inserir(m, idx, k, v);
+            Ok(())
+        })();
+        if let Err(e) = r {
+            // O erro original vence o de `return`.
+            let _ = m.fechar_iterador(reg);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 /// Item `[k, v]` de `new Map(iterável)`.
 fn par_de(m: &mut Motor, par: Valor) -> Res<(Valor, Valor)> {
     if !m.e_objeto(par) {
@@ -337,19 +479,27 @@ fn para_cada(m: &mut Motor, idx: usize, cb: Valor, arg_this: Valor, obj: Valor, 
         let d = m.inspecionar(cb, 0);
         return m.erro_tipo(&format!("{d} is not a function"));
     }
+    // O coletor roda no callback: o callback, o `this` dele e o objeto moram em `raizes` (os
+    // itens, na tabela, que é raiz; o índice dela não muda).
+    let base = m.raizes.len();
+    m.raizes.extend([cb, arg_this, obj]);
     let mut i = 0;
-    loop {
+    let r = loop {
         let item = match m.tabelas[idx].itens.get(i) {
             Some(x) => *x,
-            None => break,
+            None => break Ok(()),
         };
         i += 1;
         if let Some((k, v)) = item {
+            let (cb, arg_this, obj) = (m.raizes[base], m.raizes[base + 1], m.raizes[base + 2]);
             let args = if mapa { [v, k, obj] } else { [k, k, obj] };
-            m.chamar(cb, arg_this, &args)?;
+            if let Err(e) = m.chamar_coletavel(cb, arg_this, &args) {
+                break Err(e);
+            }
         }
-    }
-    Ok(())
+    };
+    m.raizes.truncate(base);
+    r
 }
 
 fn novo_iterador(m: &mut Motor, this: Valor, classes: &[Classe], nome: &str, tipo: u32, proto: Valor) -> Res<Valor> {
@@ -401,11 +551,7 @@ fn map_construtor(m: &mut Motor, _this: Valor, a: Args, nt: Valor) -> Res<Valor>
     let o = novo_com(m, p, Classe::Mapa);
     let it = m.arg(a, 0);
     if !it.e_nulo_ou_indefinido() {
-        let idx = m.interno(o, 1) as usize;
-        for par in m.coletar_iteravel(it)? {
-            let (k, v) = par_de(m, par)?;
-            inserir(m, idx, k, v);
-        }
+        adicionar_de(m, o, it, "set", map_set, true, None)?;
     }
     Ok(o)
 }
@@ -471,30 +617,32 @@ fn map_entries(m: &mut Motor, this: Valor, _a: Args, _nt: Valor) -> Res<Valor> {
 fn map_group_by(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     let p = m.capturado();
     let itens_v = m.arg(a, 0);
-    let itens = m.coletar_iteravel(itens_v)?;
+    if itens_v.e_nulo_ou_indefinido() {
+        return m.erro_tipo("Map.groupBy called on null or undefined");
+    }
     let cb = m.arg(a, 1);
     if !m.e_funcao(cb) {
         let d = m.inspecionar(cb, 0);
         return m.erro_tipo(&format!("{d} is not a function"));
     }
-    let o = novo_com(m, p, Classe::Mapa);
-    let idx = m.interno(o, 1) as usize;
     let mut grupos: Vec<(Valor, Vec<Valor>)> = Vec::new();
     let mut pos: HashMap<ChaveTabela, usize> = HashMap::new();
-    for (i, x) in itens.into_iter().enumerate() {
+    m.percorrer_iteravel(itens_v, |m, x, i| {
         let iv = m.numero(i as f64);
         let k = m.chamar(cb, Valor::UNDEFINED, &[x, iv])?;
         let k = sem_menos_zero(m, k);
         let ch = chave_tabela(m, k);
-        let g = pos.get(&ch).copied();
-        match g {
+        match pos.get(&ch).copied() {
             Some(g) => grupos[g].1.push(x),
             None => {
                 pos.insert(ch, grupos.len());
                 grupos.push((k, vec![x]));
             }
         }
-    }
+        Ok(())
+    })?;
+    let o = novo_com(m, p, Classe::Mapa);
+    let idx = m.interno(o, 1) as usize;
     for (k, grupo) in grupos {
         let arr = m.array_de(&grupo);
         inserir(m, idx, k, arr);
@@ -510,10 +658,7 @@ fn set_construtor(m: &mut Motor, _this: Valor, a: Args, nt: Valor) -> Res<Valor>
     let o = novo_com(m, p, Classe::Conjunto);
     let it = m.arg(a, 0);
     if !it.e_nulo_ou_indefinido() {
-        let idx = m.interno(o, 1) as usize;
-        for x in m.coletar_iteravel(it)? {
-            inserir(m, idx, x, x);
-        }
+        adicionar_de(m, o, it, "add", set_add, false, None)?;
     }
     Ok(o)
 }
@@ -660,12 +805,7 @@ fn wm_construtor(m: &mut Motor, _this: Valor, a: Args, nt: Valor) -> Res<Valor> 
     let o = novo_com(m, p, Classe::MapaFraco);
     let it = m.arg(a, 0);
     if !it.e_nulo_ou_indefinido() {
-        let idx = m.interno(o, 1) as usize;
-        for par in m.coletar_iteravel(it)? {
-            let (k, v) = par_de(m, par)?;
-            validar_fraca(m, k, "Invalid value used as weak map key")?;
-            inserir(m, idx, k, v);
-        }
+        adicionar_de(m, o, it, "set", wm_set, true, Some("Invalid value used as weak map key"))?;
     }
     Ok(o)
 }
@@ -702,11 +842,7 @@ fn ws_construtor(m: &mut Motor, _this: Valor, a: Args, nt: Valor) -> Res<Valor> 
     let o = novo_com(m, p, Classe::ConjuntoFraco);
     let it = m.arg(a, 0);
     if !it.e_nulo_ou_indefinido() {
-        let idx = m.interno(o, 1) as usize;
-        for x in m.coletar_iteravel(it)? {
-            validar_fraca(m, x, "Invalid value used in weak set")?;
-            inserir(m, idx, x, x);
-        }
+        adicionar_de(m, o, it, "add", ws_add, false, Some("Invalid value used in weak set"))?;
     }
     Ok(o)
 }

@@ -8,7 +8,7 @@ use crate::intrinsecos::{simb, TipoErro};
 use crate::motor::Motor;
 use crate::nomes::fixos;
 use crate::regex::{Flags, Programa};
-use crate::textos::ChaveProp;
+use crate::textos::{ChaveProp, TEXTO_MAX};
 use crate::valor::Valor;
 use std::rc::Rc;
 
@@ -36,6 +36,7 @@ pub(super) fn instalar(m: &mut Motor) {
     m.metodo(p, "test", 1, test);
     m.metodo(p, "toString", 0, to_string);
     m.metodo(p, "compile", 2, compile);
+    m.metodo(ctor, "escape", 1, escapar);
     let getters: &[(&str, FnNativa)] = &[
         ("source", get_source),
         ("flags", get_flags),
@@ -60,7 +61,9 @@ pub(super) fn instalar(m: &mut Motor) {
         (simb::SEARCH, "[Symbol.search]", simbolo_search),
         (simb::SPLIT, "[Symbol.split]", simbolo_split),
     ] {
-        let fv = m.nativa(n, 1, f, false);
+        // length da norma: @@replace e @@split recebem 2 argumentos.
+        let aridade = if s == simb::REPLACE || s == simb::SPLIT { 2 } else { 1 };
+        let fv = m.nativa(n, aridade, f, false);
         m.definir_propria(p, s, fv, attr::METODO);
     }
     let sp = m.nativa("get [Symbol.species]", 0, especie, false);
@@ -204,23 +207,33 @@ fn este(m: &mut Motor, v: Valor) -> Res<Valor> {
 // ---------------------------------------------------------------- exec
 
 fn ler_last_index(m: &mut Motor, re: Valor) -> Res<f64> {
-    let li = m.chave("lastIndex");
-    let v = m.obter(re, ChaveProp::Nome(li))?;
+    let v = m.obter(re, ChaveProp::Nome(fixos::LAST_INDEX))?;
     m.para_comprimento(v)
 }
 
 fn por_last_index(m: &mut Motor, re: Valor, i: f64) -> Res<()> {
-    let li = m.chave("lastIndex");
+    let li = fixos::LAST_INDEX;
     let v = m.numero(i);
     m.gravar(re, ChaveProp::Nome(li), v, true)
 }
 
 /// RegExpBuiltinExec: casamento cru (faixas) ou `None`.
 fn casar(m: &mut Motor, re: Valor, s: &[u16]) -> Res<Option<Vec<Option<(usize, usize)>>>> {
+    // Norma (§22.2.7.2): `lastIndex` primeiro (o valueOf dele pode chamar `compile`), depois as
+    // flags e o programa.
+    let global_ou_aderente = m.interno(re, 1) & (G | Y) != 0;
+    let li = if global_ou_aderente {
+        ler_last_index(m, re)?
+    } else {
+        // Sem g/y o valor não é usado: só a conversão, que só tem efeito (ou erro) se não é número.
+        let v = m.obter(re, ChaveProp::Nome(fixos::LAST_INDEX))?;
+        if !m.e_numero(v) {
+            m.para_comprimento(v)?;
+        }
+        0.0
+    };
     let b = m.interno(re, 1);
     let prog = Rc::clone(&m.regexes[m.interno(re, 2) as usize]);
-    let global_ou_aderente = b & (G | Y) != 0;
-    let li = if global_ou_aderente { ler_last_index(m, re)? } else { 0.0 };
     if li > s.len() as f64 {
         if global_ou_aderente {
             por_last_index(m, re, 0.0)?;
@@ -285,6 +298,20 @@ fn resultado(m: &mut Motor, re: Valor, entrada: Valor, s: &[u16], caps: &[Option
             });
         }
         let ind = m.array_de(&pares);
+        // `indices.groups`: objeto com os pares dos grupos nomeados (ou undefined).
+        let gi = if prog.nomes().is_empty() {
+            Valor::UNDEFINED
+        } else {
+            let f = m.forma_para(Classe::Comum, Valor::NULL, 4);
+            let g = m.novo_objeto(f);
+            for (nome, i) in prog.nomes() {
+                let k = m.nomes.internar(nome);
+                let v = pares.get(*i).copied().unwrap_or(Valor::UNDEFINED);
+                m.definir_propria(g, k, v, attr::PADRAO);
+            }
+            g
+        };
+        m.definir_propria(ind, fixos::GROUPS, gi, attr::PADRAO);
         let k = m.chave("indices");
         m.definir_propria(arr, k, ind, attr::PADRAO);
     }
@@ -301,8 +328,9 @@ fn exec(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     }
 }
 
-/// RegExpExec: usa o `exec` do objeto se foi trocado.
-fn regex_exec(m: &mut Motor, re: Valor, t: Valor) -> Res<Valor> {
+/// RegExpExec: usa o `exec` do objeto se foi trocado. `s`: as unidades de `t` (quem chama em
+/// laço converte uma vez; converter a cada casamento deixava `match`/`replace` com /g quadráticos).
+fn regex_exec(m: &mut Motor, re: Valor, t: Valor, s: &[u16]) -> Res<Valor> {
     let k = m.chave("exec");
     let f = m.obter(re, ChaveProp::Nome(k))?;
     if m.e_funcao(f) && f != m.intr.regex_exec {
@@ -313,9 +341,8 @@ fn regex_exec(m: &mut Motor, re: Valor, t: Valor) -> Res<Valor> {
         return Ok(r);
     }
     let re = este(m, re)?;
-    let s = m.texto_u16_de(t);
-    match casar(m, re, &s)? {
-        Some(caps) => Ok(resultado(m, re, t, &s, &caps)),
+    match casar(m, re, s)? {
+        Some(caps) => Ok(resultado(m, re, t, s, &caps)),
         None => Ok(Valor::NULL),
     }
 }
@@ -332,7 +359,8 @@ fn test(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
         let s = m.texto_u16_de(t);
         return Ok(Valor::bool(casar(m, this, &s)?.is_some()));
     }
-    let r = regex_exec(m, this, t)?;
+    let s = m.texto_u16_de(t);
+    let r = regex_exec(m, this, t, &s)?;
     Ok(Valor::bool(r != Valor::NULL))
 }
 
@@ -440,11 +468,41 @@ fn avancar(s: &[u16], i: usize, unicode: bool) -> usize {
     }
 }
 
+/// Atalho do laço global para um RegExp com o `exec` original e sem grupos nomeados: só as faixas,
+/// sem montar um array de resultado por casamento. None = não serve, use `resultados`.
+/// O `lastIndex` é próprio, de dados e não configurável: só as gravações do início e do fim se veem.
+fn faixas_globais(m: &mut Motor, re: Valor, s: &[u16], unicode: bool) -> Res<Option<Vec<Vec<Option<(usize, usize)>>>>> {
+    if !m.e_regex(re) {
+        return Ok(None);
+    }
+    let k = m.chave("exec");
+    if m.obter(re, ChaveProp::Nome(k))? != m.intr.regex_exec {
+        return Ok(None);
+    }
+    let prog = Rc::clone(&m.regexes[m.interno(re, 2) as usize]);
+    if !prog.nomes().is_empty() {
+        return Ok(None);
+    }
+    let aderente = m.interno(re, 1) & Y != 0;
+    por_last_index(m, re, 0.0)?;
+    let mut r = Vec::new();
+    let mut i = 0;
+    while i <= s.len() {
+        let Some(caps) = (if aderente { prog.casar_em(s, i) } else { prog.procurar(s, i) }) else { break };
+        let (a, b) = caps[0].unwrap_or((i, i));
+        i = if a == b { avancar(s, b, unicode) } else { b };
+        r.push(caps);
+    }
+    por_last_index(m, re, 0.0)?;
+    Ok(Some(r))
+}
+
 /// Todos os resultados (global) ou o primeiro.
 fn resultados(m: &mut Motor, re: Valor, t: Valor, todos: bool) -> Res<Vec<Valor>> {
     let mut r = Vec::new();
     if !todos {
-        let x = regex_exec(m, re, t)?;
+        let s = m.texto_u16_de(t);
+        let x = regex_exec(m, re, t, &s)?;
         if x != Valor::NULL {
             r.push(x);
         }
@@ -454,7 +512,7 @@ fn resultados(m: &mut Motor, re: Valor, t: Valor, todos: bool) -> Res<Vec<Valor>
     por_last_index(m, re, 0.0)?;
     let s = m.texto_u16_de(t);
     loop {
-        let x = regex_exec(m, re, t)?;
+        let x = regex_exec(m, re, t, &s)?;
         if x == Valor::NULL {
             break;
         }
@@ -471,7 +529,18 @@ fn resultados(m: &mut Motor, re: Valor, t: Valor, todos: bool) -> Res<Vec<Valor>
 
 fn simbolo_match(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     let t = m.para_texto(m.arg(a, 0))?;
-    let global = flags_de(m, this)? & G != 0;
+    let fl = flags_de(m, this)?;
+    let global = fl & G != 0;
+    if global {
+        let s = m.texto_u16_de(t);
+        if let Some(fs) = faixas_globais(m, this, &s, fl & (U | V) != 0)? {
+            if fs.is_empty() {
+                return Ok(Valor::NULL);
+            }
+            let v: Vec<Valor> = fs.iter().map(|c| c[0].map_or(Valor::VAZIA, |(i, j)| m.texto_u16(&s[i..j]))).collect();
+            return Ok(m.array_de(&v));
+        }
+    }
     let rs = resultados(m, this, t, global)?;
     if !global {
         return Ok(rs.first().copied().unwrap_or(Valor::NULL));
@@ -504,34 +573,47 @@ fn simbolo_match_all(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Val
     m.chamar(f, arr, &[])
 }
 
-/// GetSubstitution (§22.1.3.19.1).
-fn substituicao(m: &mut Motor, casado: &[u16], s: &[u16], pos: usize, caps: &[Valor], grupos: Valor, modelo: &[u16]) -> Res<Vec<u16>> {
-    let mut r = Vec::new();
+/// Junta `u` ao texto em montagem sem passar do maior texto e sem abortar o processo se faltar
+/// memória: `"1".repeat(2**20).replace(/(.+)/g, "$1".repeat(2**16))` pediria 2³⁶ unidades.
+fn anexar(m: &mut Motor, r: &mut Vec<u16>, u: &[u16]) -> Res<()> {
+    if r.len() + u.len() > TEXTO_MAX as usize {
+        return m.erro_alcance("Invalid string length");
+    }
+    if r.capacity() - r.len() < u.len() && r.try_reserve(u.len()).is_err() {
+        return m.erro_alcance("Out of memory");
+    }
+    r.extend_from_slice(u);
+    Ok(())
+}
+
+/// GetSubstitution: entrega os pedaços do resultado a `r`, em ordem.
+#[allow(clippy::too_many_arguments)]
+fn substituir_em(m: &mut Motor, casado: &[u16], s: &[u16], pos: usize, caps: &[Valor], grupos: Valor, modelo: &[u16], r: &mut dyn FnMut(&mut Motor, &[u16]) -> Res<()>) -> Res<()> {
     let mut i = 0;
     let fim = (pos + casado.len()).min(s.len());
     while i < modelo.len() {
         let c = modelo[i];
         if c != b'$' as u16 || i + 1 >= modelo.len() {
-            r.push(c);
+            r(m, &[c])?;
             i += 1;
             continue;
         }
         let d = modelo[i + 1];
         match d {
             0x24 => {
-                r.push(0x24);
+                r(m, &[0x24])?;
                 i += 2;
             }
             0x26 => {
-                r.extend_from_slice(casado);
+                r(m, casado)?;
                 i += 2;
             }
             0x60 => {
-                r.extend_from_slice(&s[..pos.min(s.len())]);
+                r(m, &s[..pos.min(s.len())])?;
                 i += 2;
             }
             0x27 => {
-                r.extend_from_slice(&s[fim..]);
+                r(m, &s[fim..])?;
                 i += 2;
             }
             0x30..=0x39 => {
@@ -545,17 +627,18 @@ fn substituicao(m: &mut Motor, casado: &[u16], s: &[u16], pos: usize, caps: &[Va
                     let v = caps[n - 1];
                     if v != Valor::UNDEFINED {
                         let t = m.para_texto(v)?;
-                        r.extend(m.texto_u16_de(t));
+                        let u = m.texto_u16_de(t);
+                        r(m, &u)?;
                     }
                     i += largura;
                 } else {
-                    r.push(0x24);
+                    r(m, &[0x24])?;
                     i += 1;
                 }
             }
             0x3c if grupos != Valor::UNDEFINED => {
                 let Some(fecha) = modelo[i + 2..].iter().position(|&x| x == b'>' as u16) else {
-                    r.push(0x24);
+                    r(m, &[0x24])?;
                     i += 1;
                     continue;
                 };
@@ -564,16 +647,38 @@ fn substituicao(m: &mut Motor, casado: &[u16], s: &[u16], pos: usize, caps: &[Va
                 let v = m.obter(grupos, ChaveProp::Nome(k))?;
                 if v != Valor::UNDEFINED {
                     let t = m.para_texto(v)?;
-                    r.extend(m.texto_u16_de(t));
+                    let u = m.texto_u16_de(t);
+                    r(m, &u)?;
                 }
                 i += 3 + fecha;
             }
             _ => {
-                r.push(0x24);
+                r(m, &[0x24])?;
                 i += 1;
             }
         }
     }
+    Ok(())
+}
+
+/// GetSubstitution (§22.1.3.19.1). O tamanho sai antes: um `$1` repetido pode pedir mais que o
+/// maior texto, e aí é RangeError sem montar nada.
+fn substituicao(m: &mut Motor, casado: &[u16], s: &[u16], pos: usize, caps: &[Valor], grupos: Valor, modelo: &[u16]) -> Res<Vec<u16>> {
+    if !modelo.contains(&0x24) {
+        return Ok(modelo.to_vec());
+    }
+    {
+        let mut n = 0usize;
+        substituir_em(m, casado, s, pos, caps, grupos, modelo, &mut |_, u| {
+            n += u.len();
+            Ok(())
+        })?;
+        if n > TEXTO_MAX as usize {
+            return m.erro_alcance("Invalid string length");
+        }
+    }
+    let mut r = Vec::new();
+    substituir_em(m, casado, s, pos, caps, grupos, modelo, &mut |m, u| anexar(m, &mut r, u))?;
     Ok(r)
 }
 
@@ -593,10 +698,35 @@ fn simbolo_replace(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor
         subst = m.para_texto(subst)?;
     }
     let modelo = if funcional { Vec::new() } else { m.texto_u16_de(subst) };
-    let global = flags_de(m, this)? & G != 0;
-    let rs = resultados(m, this, t, global)?;
+    let fl = flags_de(m, this)?;
+    let global = fl & G != 0;
     let mut saida = Vec::new();
     let mut prox = 0usize;
+    if global {
+        if let Some(fs) = faixas_globais(m, this, &s, fl & (U | V) != 0)? {
+            for c in fs {
+                let (pos, fim) = c[0].unwrap_or((0, 0));
+                let caps: Vec<Valor> = c[1..].iter().map(|x| x.map_or(Valor::UNDEFINED, |(i, j)| m.texto_u16(&s[i..j]))).collect();
+                let troca = if funcional {
+                    let mut args = vec![m.texto_u16(&s[pos..fim])];
+                    args.extend_from_slice(&caps);
+                    args.push(m.numero(pos as f64));
+                    args.push(t);
+                    let r = m.chamar(subst, Valor::UNDEFINED, &args)?;
+                    let r = m.para_texto(r)?;
+                    m.texto_u16_de(r)
+                } else {
+                    substituicao(m, &s[pos..fim], &s, pos, &caps, Valor::UNDEFINED, &modelo)?
+                };
+                anexar(m, &mut saida, &s[prox..pos])?;
+                anexar(m, &mut saida, &troca)?;
+                prox = fim;
+            }
+            saida.extend_from_slice(&s[prox..]);
+            return Ok(m.texto_u16(&saida));
+        }
+    }
+    let rs = resultados(m, this, t, global)?;
     for x in rs {
         let n = m.comprimento_de(x)?;
         let c0 = m.obter(x, ChaveProp::Indice(0))?;
@@ -626,8 +756,8 @@ fn simbolo_replace(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor
             substituicao(m, &casado, &s, pos, &caps, g, &modelo)?
         };
         if pos >= prox {
-            saida.extend_from_slice(&s[prox..pos]);
-            saida.extend(troca);
+            anexar(m, &mut saida, &s[prox..pos])?;
+            anexar(m, &mut saida, &troca)?;
             prox = pos + casado.len();
         }
     }
@@ -641,7 +771,8 @@ fn simbolo_search(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor>
     let t = m.para_texto(m.arg(a, 0))?;
     let antes = ler_last_index(m, this)?;
     por_last_index(m, this, 0.0)?;
-    let r = regex_exec(m, this, t)?;
+    let s = m.texto_u16_de(t);
+    let r = regex_exec(m, this, t, &s)?;
     por_last_index(m, this, antes)?;
     if r == Valor::NULL {
         return Ok(Valor::int(-1));
@@ -649,52 +780,184 @@ fn simbolo_search(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor>
     m.obter(r, ChaveProp::Nome(fixos::INDEX))
 }
 
+/// RegExp.escape (ES2025): escapa uma string para ser casada literalmente.
+fn escapar(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    let v = m.arg(a, 0);
+    if !m.e_texto(v) {
+        return m.erro_tipo("RegExp.escape requires a string");
+    }
+    let s = m.texto_u16_de(v);
+    let mut out: Vec<u16> = Vec::with_capacity(s.len() * 2);
+    // `\xHH` (n = 2) ou `\uHHHH` (n = 4), em minúsculas.
+    let hex = |out: &mut Vec<u16>, c: u32, n: usize| {
+        out.push('\\' as u16);
+        out.push(if n == 2 { 'x' } else { 'u' } as u16);
+        for ch in format!("{:0w$x}", c, w = n).encode_utf16() {
+            out.push(ch);
+        }
+    };
+    let mut i = 0;
+    while i < s.len() {
+        let u = s[i] as u32;
+        // Par substituto válido: copia os dois como estão.
+        if (0xD800..0xDC00).contains(&u) && i + 1 < s.len() && (0xDC00..0xE000).contains(&(s[i + 1] as u32)) {
+            out.push(s[i]);
+            out.push(s[i + 1]);
+            i += 2;
+            continue;
+        }
+        let ch = char::from_u32(u).unwrap_or('\0');
+        let primeiro = i == 0;
+        if primeiro && ch.is_ascii_alphanumeric() {
+            hex(&mut out, u, 2);
+        } else if "^$\\.*+?()[]{}|/".contains(ch) {
+            out.push('\\' as u16);
+            out.push(s[i]);
+        } else if let Some(e) = match ch {
+            '\t' => Some('t'),
+            '\n' => Some('n'),
+            '\u{b}' => Some('v'),
+            '\u{c}' => Some('f'),
+            '\r' => Some('r'),
+            _ => None,
+        } {
+            out.push('\\' as u16);
+            out.push(e as u16);
+        } else if ",-=<>#&!%:;@~'`\"".contains(ch) {
+            hex(&mut out, u, 2);
+        } else if u == 0x20 || u == 0xA0 {
+            hex(&mut out, u, 2);
+        } else if matches!(u, 0x1680 | 0x2000..=0x200A | 0x2028 | 0x2029 | 0x202F | 0x205F | 0x3000 | 0xFEFF)
+            || (0xD800..0xE000).contains(&u)
+        {
+            hex(&mut out, u, 4);
+        } else {
+            out.push(s[i]);
+        }
+        i += 1;
+    }
+    Ok(m.texto_u16(&out))
+}
+
+/// SpeciesConstructor(o, %RegExp%) (§7.3.22).
+fn construtor_da_especie(m: &mut Motor, o: Valor) -> Res<Valor> {
+    let kc = ChaveProp::Nome(fixos::CONSTRUCTOR);
+    let padrao = m.obter(m.intr.regex_proto, kc)?;
+    let c = m.obter(o, kc)?;
+    if c == Valor::UNDEFINED {
+        return Ok(padrao);
+    }
+    if !m.e_objeto(c) {
+        return m.erro_tipo("object.constructor is not an object");
+    }
+    let sp = m.obter(c, ChaveProp::Nome(simb::SPECIES))?;
+    if sp == Valor::UNDEFINED || sp == Valor::NULL {
+        return Ok(padrao);
+    }
+    if m.e_construtor(sp) {
+        return Ok(sp);
+    }
+    m.erro_tipo("object.constructor[Symbol.species] is not a constructor")
+}
+
+/// RegExp.prototype[@@split] (§22.2.6.14): genérico, com o construtor da espécie e um
+/// splitter sticky. Cada posição tenta um casamento colado em `q`.
 fn simbolo_split(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    if !m.e_objeto(this) {
+        return m.erro_tipo("RegExp.prototype[Symbol.split] called on non-object");
+    }
     let t = m.para_texto(m.arg(a, 0))?;
+    let c = construtor_da_especie(m, this)?;
+    let kf = m.chave("flags");
+    let fv = m.obter(this, ChaveProp::Nome(kf))?;
+    let fv = m.para_texto(fv)?;
+    let flags = String::from_utf16_lossy(&m.texto_u16_de(fv));
+    let unicode = flags.contains('u') || flags.contains('v');
+    let novas = if flags.contains('y') { flags } else { format!("{flags}y") };
+    let nf = m.texto(&novas);
+    let splitter = m.construir(c, &[this, nf], c)?;
     let s = m.texto_u16_de(t);
     let lim = m.arg(a, 1);
     let lim = if lim == Valor::UNDEFINED { u32::MAX } else { m.para_uint32(lim)? };
-    let re = este(m, this)?;
-    let prog = Rc::clone(&m.regexes[m.interno(re, 2) as usize]);
-    let unicode = m.interno(re, 1) & (U | V) != 0;
     let mut r: Vec<Valor> = Vec::new();
     if lim == 0 {
         return Ok(m.array_de(&r));
     }
     if s.is_empty() {
-        if prog.casar_em(&s, 0).is_none() {
+        if regex_exec(m, splitter, t, &s)? == Valor::NULL {
             r.push(t);
         }
         return Ok(m.array_de(&r));
     }
     let (mut p, mut q) = (0usize, 0usize);
-    while q < s.len() {
-        let Some(caps) = prog.procurar(&s, q) else { break };
-        let (ini, fim) = caps[0].unwrap_or((s.len(), s.len()));
-        if ini >= s.len() {
-            break;
+    // Atalho: o splitter é um RegExp comum (protótipo e `exec` originais, aderente, mesmo modo
+    // unicode). Ninguém mais vê o `lastIndex` dele, e as tentativas aderentes posição a posição
+    // equivalem a procurar adiante: busca com o atalho do primeiro caractere, sem um objeto de
+    // resultado por casamento.
+    let ke = m.chave("exec");
+    let comum = m.e_regex(splitter)
+        && m.proto_de(splitter) == m.intr.regex_proto
+        && m.interno(splitter, 1) & Y != 0
+        && (m.interno(splitter, 1) & (U | V) != 0) == unicode
+        && m.obter(splitter, ChaveProp::Nome(ke))? == m.intr.regex_exec;
+    if comum {
+        let prog = Rc::clone(&m.regexes[m.interno(splitter, 2) as usize]);
+        while q < s.len() {
+            let Some(caps) = prog.procurar_adiante(&s, q) else { break };
+            let Some((ini, fim)) = caps[0] else { break };
+            if ini >= s.len() {
+                break;
+            }
+            let fim = fim.min(s.len());
+            if fim == p {
+                q = avancar(&s, ini, unicode);
+                continue;
+            }
+            r.push(m.texto_u16(&s[p..ini]));
+            if r.len() as u32 == lim {
+                return Ok(m.array_de(&r));
+            }
+            p = fim;
+            for c in &caps[1..] {
+                r.push(c.map_or(Valor::UNDEFINED, |(i, j)| m.texto_u16(&s[i..j])));
+                if r.len() as u32 == lim {
+                    return Ok(m.array_de(&r));
+                }
+            }
+            q = p;
         }
-        if fim == p || (fim == ini && ini == p) {
-            q = avancar(&s, ini.max(q), unicode);
+        r.push(m.texto_u16(&s[p..]));
+        return Ok(m.array_de(&r));
+    }
+    let kl = m.chave("length");
+    while q < s.len() {
+        por_last_index(m, splitter, q as f64)?;
+        let z = regex_exec(m, splitter, t, &s)?;
+        if z == Valor::NULL {
+            q = avancar(&s, q, unicode);
             continue;
         }
-        let pedaco = m.texto_u16(&s[p..ini]);
+        let e = (ler_last_index(m, splitter)? as usize).min(s.len());
+        if e == p {
+            q = avancar(&s, q, unicode);
+            continue;
+        }
+        let pedaco = m.texto_u16(&s[p..q]);
         r.push(pedaco);
         if r.len() as u32 == lim {
             return Ok(m.array_de(&r));
         }
-        for c in &caps[1..] {
-            let v = match c {
-                Some((i, j)) => m.texto_u16(&s[*i..*j]),
-                None => Valor::UNDEFINED,
-            };
+        p = e;
+        let n = m.obter(z, ChaveProp::Nome(kl))?;
+        let n = (m.para_comprimento(n)? as usize).max(1) - 1;
+        for i in 1..=n {
+            let v = m.obter(z, ChaveProp::Indice(i as u32))?;
             r.push(v);
             if r.len() as u32 == lim {
                 return Ok(m.array_de(&r));
             }
         }
-        p = fim;
-        q = if fim == ini { avancar(&s, fim, unicode) } else { fim };
+        q = p;
     }
     let resto = m.texto_u16(&s[p..]);
     r.push(resto);

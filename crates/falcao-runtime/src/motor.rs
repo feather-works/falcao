@@ -23,8 +23,6 @@ pub struct Motor {
     /// `let`/`const`/`class` do topo dos scripts: nome → (índice em `lexico_valores`, const).
     pub lexico: std::collections::HashMap<u32, (u32, bool)>,
     pub lexico_valores: Vec<Valor>,
-    /// Nome privado (`#x`) → símbolo escondido.
-    pub privados: std::collections::HashMap<u32, Chave>,
     /// Símbolos que a reflexão não mostra (privados e internos).
     pub escondidos: std::collections::HashSet<u32>,
     /// Algum item indexado tem atributos fora do padrão (mora como nome; ver `propriedades`).
@@ -53,13 +51,29 @@ pub struct Motor {
     /// Programas de regex compilados e o cache por (fonte, flags).
     pub regexes: Vec<std::rc::Rc<crate::regex::Programa>>,
     pub cache_regex: std::collections::HashMap<(Vec<u16>, Vec<u16>), u32>,
+    /// Formas 2 a 4 dos caches de propriedade polimórficos (`CacheProp::poli`).
+    pub(crate) poli: Vec<[crate::funcoes::CacheProp; 3]>,
+    /// Caches megamórficos: (forma, nome) → onde está (tabela global da seção 8).
+    pub(crate) mega: falcao_sintaxe::atomos::MapaRapido<(u32, Chave), crate::funcoes::CacheProp>,
     /// Profundidade de laços do intérprete abertos por nativas (o coletor só roda no 0).
     pub aninhamento: u32,
+    /// Quantos desses níveis guardam em `raizes` tudo o que usam depois da chamada
+    /// ([`Motor::chamar_coletavel`]): com todos seguros, o coletor roda lá dentro.
+    pub(crate) seguro: u32,
     /// Saída do `console` (nível, texto). Sem ela, vai para a saída padrão.
     pub ao_imprimir: Option<Box<dyn FnMut(u8, &str)>>,
     /// Olhado a cada 65.536 voltas de laço: `Some(motivo)` interrompe o script com um Error
     /// (prazo, botão Parar). Quem embute decide; uma vez interrompido, a olhada continua dizendo sim.
     pub interromper: Option<Box<dyn FnMut() -> Option<String>>>,
+    /// A gaiola passou do teto: o erro sobe sem parar em `catch`/`finally` até quem embute
+    /// (como a aba que cai no navegador), senão o próprio `catch` estouraria de novo.
+    pub(crate) terminando: bool,
+    /// Endereço da pilha do Rust na entrada mais externa do JS (0 fora dele).
+    pub(crate) base_pilha: usize,
+    /// Bytes da pilha do Rust que o motor pode usar abaixo da entrada antes de dar
+    /// "Maximum call stack size exceeded" (Proxy de Proxy, `bind` de `bind`, JSON fundo…).
+    /// O padrão cabe numa thread de 2 MB; quem embute numa pilha maior pode subir.
+    pub limite_pilha: usize,
     /// O último erro que o próprio motor criou e a profundidade da pilha naquela hora: o
     /// intérprete refaz a pilha dele já com a instrução certa ([`Motor::reanotar_erro`]).
     pub erro_interno: (Valor, u32),
@@ -118,7 +132,6 @@ impl Motor {
             intr: crate::intrinsecos::Intrinsecos::vazios(),
             lexico: Default::default(),
             lexico_valores: Vec::new(),
-            privados: Default::default(),
             escondidos: Default::default(),
             indices_especiais: false,
             chamado: Valor::UNDEFINED,
@@ -135,9 +148,15 @@ impl Motor {
             tabelas: Vec::new(),
             regexes: Vec::new(),
             cache_regex: Default::default(),
+            poli: Vec::new(),
+            mega: Default::default(),
             aninhamento: 0,
+            seguro: 0,
             ao_imprimir: None,
             interromper: None,
+            terminando: false,
+            base_pilha: 0,
+            limite_pilha: 1 << 20,
             erro_interno: (Valor::UNDEFINED, 0),
             voltas: 0,
             hospede: None,

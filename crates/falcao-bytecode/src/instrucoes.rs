@@ -92,6 +92,8 @@ instrucoes! {
     LeDinamico(K, C),
     LeDinamicoTypeof(K, C),
     GravaDinamico(K, C),
+    /// acc = algum objeto de `with` nos N primeiros contextos tem o nome K (sem `unscopables`).
+    TemCom(K, N),
     /// ReferenceError se acc é o buraco (TDZ) — nome K para a mensagem.
     ChecaTdz(K),
 
@@ -114,15 +116,18 @@ instrucoes! {
     GravaSuper(R, K),
     LeSuperItem(R, R),
     GravaSuperItem(R, R, R),
-    /// acc = r.#k (campo privado K)
-    LePrivado(R, K),
-    GravaPrivado(R, K),
-    /// acc = #k in acc
-    TemPrivado(K),
-    /// Cria o campo privado K em r com o valor de acc.
-    DefinePrivado(R, K),
-    /// acc = chave do nome privado K (`#x`): um símbolo escondido da reflexão.
-    ChavePrivada(K),
+    /// acc = r0.#x, com o nome privado (símbolo escondido) em r1. Só o próprio objeto: sem
+    /// protótipo e sem armadilha de Proxy.
+    LePrivado(R, R),
+    /// r0.#x = acc (nome em r1).
+    GravaPrivado(R, R),
+    /// acc = #x in acc (nome em r).
+    TemPrivado(R),
+    /// Acrescenta #x (nome em r1) a r0 com o valor de acc. N: 0 campo, 1 método, 2 getter,
+    /// 3 setter. Campo ou método repetido é TypeError.
+    DefinePrivado(R, R, N),
+    /// acc = nome privado novo (símbolo escondido da reflexão) com a descrição K (`#x`).
+    NovoPrivado(K),
 
     // ---- Literais ----
     /// acc = {} com N campos na linha
@@ -130,7 +135,7 @@ instrucoes! {
     /// acc = [] com capacidade N
     CriaArray(N),
     /// Define r.k = acc (própria, enumerável), sem chamar setter.
-    DefProp(R, K),
+    DefProp(R, K, C),
     /// Define r[r1] = acc (própria).
     DefItem(R, R),
     /// Acrescenta acc no fim do array r.
@@ -156,11 +161,15 @@ instrucoes! {
     CriaFuncao(K),
     /// acc = classe: construtor K, herança em r (ou buraco).
     CriaClasse(K, R),
-    /// Registra na classe r0 o campo de instância de chave r1, com o inicializador em acc
-    /// (função, ou undefined). O construtor roda os campos na ordem.
-    DefCampo(R, R),
+    /// Registra na classe r0 um elemento de instância de chave r1, com o valor em acc. N: 0
+    /// campo (acc = inicializador ou undefined), 1/2/3 método/getter/setter privado. O
+    /// construtor põe os métodos privados e depois roda os campos, na ordem.
+    DefCampo(R, R, N),
     /// Casa (home object) do método em acc = r.
     DefineCasa(R),
+    /// SetFunctionName: a função em acc ganha o nome da chave em r (símbolo: `[descrição]`;
+    /// nome privado: `#x`). N: 0 sem prefixo, 1 `get `, 2 `set `.
+    NomeiaFuncao(R, N),
 
     // ---- Operadores (r op acc) ----
     Soma(R, C),
@@ -198,6 +207,11 @@ instrucoes! {
     Typeof(),
     Incrementa(C),
     Decrementa(C),
+    /// r = ToNumeric(r) ± 1, sem tocar o acc (`i++` como comando, `i` local em registrador).
+    IncrementaReg(R, C),
+    DecrementaReg(R, C),
+    /// acc = ToInt32(acc) (`x | 0`).
+    ParaInt32(C),
     /// acc = String(acc) (templates)
     ParaTexto(),
     /// acc = ToPropertyKey(acc)
@@ -245,6 +259,8 @@ instrucoes! {
     Proximo(R, A),
     /// Fecha o iterador r (chama `return`), sem trocar o acc.
     FechaIterador(R),
+    /// Fecha o iterador r saindo por exceção: erro de `return` é engolido (o original vence).
+    FechaIteradorEmErro(R),
     /// r = estado de for-in sobre acc.
     PreparaForIn(R),
     /// acc = próxima chave do for-in r; salta para A quando acabou.
@@ -267,10 +283,19 @@ instrucoes! {
     IniciaGerador(),
     /// Resultado `{value: acc, done: N}`.
     CriaResultado(N),
-    /// Pega o modo de retomada (next/throw/return) em r e o valor em acc.
-    ModoRetomada(R),
-    /// Delegação `yield*` sobre o iterador r.
-    Delega(R, A),
+    /// Logo depois de `Suspende`: retomado com `return` → salta para A (acc = valor).
+    ModoRetomada(A),
+    /// `yield*` sobre o registro r: o de dentro acabou → acc = valor, salta para o 1º A;
+    /// retomado com `return` e ele acabou (ou não tem `return`) → acc = valor, salta para o 2º A.
+    Delega(R, A, A),
+    /// `for await`: acc = `next()` do registro r, sem conferir (o resultado é aguardado).
+    ChamaProximo(R),
+    /// `for await`: confere o resultado aguardado em acc; acabou → salta para A; senão acc = value.
+    ResultadoProximo(R, A),
+    /// acc = `return()` do iterador r (fechamento assíncrono); sem `return` ou já fechado → A.
+    FechaIteradorAsync(R, A),
+    /// TypeError se acc não é objeto (resultado do `return()` aguardado).
+    ExigeObjeto(),
 
     // ---- Módulos ----
     ImportDinamico(R),

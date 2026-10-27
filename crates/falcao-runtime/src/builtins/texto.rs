@@ -49,8 +49,26 @@ pub(super) fn instalar(m: &mut Motor) {
     m.metodo(proto, "toLocaleLowerCase", 0, to_lower);
     m.metodo(proto, "toLocaleUpperCase", 0, to_upper);
     m.metodo(proto, "trim", 0, trim);
-    m.metodo(proto, "trimStart", 0, trim_start);
-    m.metodo(proto, "trimEnd", 0, trim_end);
+    let ini = m.metodo(proto, "trimStart", 0, trim_start);
+    let fim = m.metodo(proto, "trimEnd", 0, trim_end);
+    // Anexo B: trimLeft e trimRight são o mesmo objeto que trimStart e trimEnd.
+    for (nome, f) in [("trimLeft", ini), ("trimRight", fim)] {
+        let c = m.chave(nome);
+        m.definir_propria(proto, c, f, attr::METODO);
+    }
+    m.metodo(proto, "anchor", 1, anchor);
+    m.metodo(proto, "big", 0, big);
+    m.metodo(proto, "blink", 0, blink);
+    m.metodo(proto, "bold", 0, bold);
+    m.metodo(proto, "fixed", 0, fixed);
+    m.metodo(proto, "fontcolor", 1, fontcolor);
+    m.metodo(proto, "fontsize", 1, fontsize);
+    m.metodo(proto, "italics", 0, italics);
+    m.metodo(proto, "link", 1, link);
+    m.metodo(proto, "small", 0, small);
+    m.metodo(proto, "strike", 0, strike);
+    m.metodo(proto, "sub", 0, sub);
+    m.metodo(proto, "sup", 0, sup);
     m.metodo(proto, "toString", 0, to_string);
     m.metodo(proto, "valueOf", 0, value_of);
     m.metodo(proto, "isWellFormed", 0, is_well_formed);
@@ -147,20 +165,21 @@ fn e_espaco(c: u16) -> bool {
     )
 }
 
-/// Método do símbolo `s` de `alvo` (`undefined` se `alvo` é nulo ou não tem o método).
+/// Método do símbolo `s` de `alvo` (`undefined` se `alvo` não é objeto ou não tem o método).
+/// Primitivos não são consultados: o `Symbol.split` etc. de `Number.prototype` não é lido.
 fn metodo_do_simbolo(m: &mut Motor, alvo: Valor, s: Chave) -> Res<Valor> {
-    if alvo.e_nulo_ou_indefinido() {
+    if !m.e_objeto(alvo) {
         return Ok(Valor::UNDEFINED);
     }
     m.obter(alvo, ChaveProp::Nome(s))
 }
 
 /// `Symbol(desc)` (SymbolDescriptiveString).
-fn descritiva(m: &mut Motor, s: Valor) -> Valor {
+fn descritiva(m: &mut Motor, s: Valor) -> Res<Valor> {
     let d = m.descricao_do_simbolo(s);
     let ini = m.texto("Symbol(");
     let meio = if d == Valor::UNDEFINED { Valor::VAZIA } else { d };
-    let x = m.concatenar(ini, meio);
+    let x = m.concatenar(ini, meio)?;
     let fim = m.texto(")");
     m.concatenar(x, fim)
 }
@@ -240,7 +259,7 @@ fn construtor(m: &mut Motor, _this: Valor, a: Args, nt: Valor) -> Res<Valor> {
     } else {
         let v = m.arg(a, 0);
         if nt == Valor::UNDEFINED && m.e_simbolo(v) {
-            descritiva(m, v)
+            descritiva(m, v)?
         } else {
             m.para_texto(v)?
         }
@@ -296,7 +315,7 @@ fn raw(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     for i in 0..n {
         let seg = m.obter_indice(bruto, i)?;
         let seg = m.para_texto(seg)?;
-        acc = m.concatenar(acc, seg);
+        acc = m.concatenar(acc, seg)?;
         if i + 1 == n {
             break;
         }
@@ -304,7 +323,7 @@ fn raw(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
         if i + 1 < u64::from(a.n) {
             let sub = m.arg(a, (i + 1) as u32);
             let sub = m.para_texto(sub)?;
-            acc = m.concatenar(acc, sub);
+            acc = m.concatenar(acc, sub)?;
         }
     }
     Ok(acc)
@@ -374,7 +393,7 @@ fn concat(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     for i in 0..a.n {
         let v = m.arg(a, i);
         let s = m.para_texto(v)?;
-        acc = m.concatenar(acc, s);
+        acc = m.concatenar(acc, s)?;
     }
     Ok(acc)
 }
@@ -513,7 +532,7 @@ fn preencher(m: &mut Motor, this: Valor, a: Args, nome: &str, no_inicio: bool) -
     let f = m.texto_u16_de(enche);
     let pad: Vec<u16> = f.iter().cycle().take(falta).copied().collect();
     let p = m.texto_u16(&pad);
-    Ok(if no_inicio { m.concatenar(p, t) } else { m.concatenar(t, p) })
+    if no_inicio { m.concatenar(p, t) } else { m.concatenar(t, p) }
 }
 
 fn pad_start(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
@@ -649,6 +668,83 @@ fn trim_end(m: &mut Motor, this: Valor, _a: Args, _nt: Valor) -> Res<Valor> {
     aparar(m, this, "trimEnd", false, true)
 }
 
+// Métodos HTML do Anexo B (CreateHTML). `attr` vazio quando o método não tem atributo.
+
+fn html(m: &mut Motor, this: Valor, a: Args, nome: &str, tag: &str, attr: &str) -> Res<Valor> {
+    let t = texto_this(m, this, nome)?;
+    let mut p: Vec<u16> = format!("<{tag}").encode_utf16().collect();
+    if !attr.is_empty() {
+        let v = m.arg(a, 0);
+        let s = m.para_texto(v)?;
+        p.extend(format!(" {attr}=\"").encode_utf16());
+        for c in m.texto_u16_de(s).iter() {
+            if *c == u16::from(b'"') {
+                p.extend("&quot;".encode_utf16());
+            } else {
+                p.push(*c);
+            }
+        }
+        p.push(u16::from(b'"'));
+    }
+    p.push(u16::from(b'>'));
+    let ini = m.texto_u16(&p);
+    let ini = m.concatenar(ini, t)?;
+    let fim = m.texto(&format!("</{tag}>"));
+    m.concatenar(ini, fim)
+}
+
+fn anchor(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    html(m, this, a, "anchor", "a", "name")
+}
+
+fn big(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    html(m, this, a, "big", "big", "")
+}
+
+fn blink(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    html(m, this, a, "blink", "blink", "")
+}
+
+fn bold(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    html(m, this, a, "bold", "b", "")
+}
+
+fn fixed(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    html(m, this, a, "fixed", "tt", "")
+}
+
+fn fontcolor(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    html(m, this, a, "fontcolor", "font", "color")
+}
+
+fn fontsize(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    html(m, this, a, "fontsize", "font", "size")
+}
+
+fn italics(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    html(m, this, a, "italics", "i", "")
+}
+
+fn link(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    html(m, this, a, "link", "a", "href")
+}
+
+fn small(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    html(m, this, a, "small", "small", "")
+}
+
+fn strike(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    html(m, this, a, "strike", "strike", "")
+}
+
+fn sub(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    html(m, this, a, "sub", "sub", "")
+}
+
+fn sup(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    html(m, this, a, "sup", "sup", "")
+}
+
 fn to_string(m: &mut Motor, this: Valor, _a: Args, _nt: Valor) -> Res<Valor> {
     texto_do_valor(m, this, "toString")
 }
@@ -706,7 +802,7 @@ fn split(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     let lim = m.arg(a, 1);
     let f = metodo_do_simbolo(m, sep, simb::SPLIT)?;
     if !f.e_nulo_ou_indefinido() {
-        return m.chamar(f, sep, &[this, lim]);
+        return m.chamar_coletavel(f, sep, &[this, lim]);
     }
     let t = texto_this(m, this, "split")?;
     let lim_n = if lim == Valor::UNDEFINED { u32::MAX } else { m.para_uint32(lim)? };
@@ -757,7 +853,7 @@ fn replace(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     let rep = m.arg(a, 1);
     let f = metodo_do_simbolo(m, pat, simb::REPLACE)?;
     if !f.e_nulo_ou_indefinido() {
-        return m.chamar(f, pat, &[this, rep]);
+        return m.chamar_coletavel(f, pat, &[this, rep]);
     }
     let t = texto_this(m, this, "replace")?;
     let s = m.para_texto(pat)?;
@@ -780,8 +876,8 @@ fn replace(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     };
     let antes = m.subtexto(t, 0, pos as u32);
     let depois = m.subtexto(t, (pos + su.len()) as u32, tu.len() as u32);
-    let x = m.concatenar(antes, sub);
-    Ok(m.concatenar(x, depois))
+    let x = m.concatenar(antes, sub)?;
+    m.concatenar(x, depois)
 }
 
 /// `replaceAll`: troca todas as ocorrências (regex precisa ser global).
@@ -800,7 +896,7 @@ fn replace_all(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     }
     let f = metodo_do_simbolo(m, pat, simb::REPLACE)?;
     if !f.e_nulo_ou_indefinido() {
-        return m.chamar(f, pat, &[this, rep]);
+        return m.chamar_coletavel(f, pat, &[this, rep]);
     }
     let t = texto_this(m, this, "replaceAll")?;
     let s = m.para_texto(pat)?;
@@ -842,7 +938,7 @@ fn replace_all(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     partes.push(m.subtexto(t, fim_ant as u32, tu.len() as u32));
     let mut acc = Valor::VAZIA;
     for p in partes {
-        acc = m.concatenar(acc, p);
+        acc = m.concatenar(acc, p)?;
     }
     Ok(acc)
 }
@@ -856,7 +952,7 @@ fn delega_regex(m: &mut Motor, this: Valor, a: Args, s: Chave, nome: &str, globa
     let rx = m.arg(a, 0);
     let f = metodo_do_simbolo(m, rx, s)?;
     if !f.e_nulo_ou_indefinido() {
-        return m.chamar(f, rx, &[this]);
+        return m.chamar_coletavel(f, rx, &[this]);
     }
     if global && e_regex(m, rx) {
         let fl = m.obter(rx, ChaveProp::Nome(fixos::FLAGS))?;
@@ -877,7 +973,7 @@ fn delega_regex(m: &mut Motor, this: Valor, a: Args, s: Chave, nome: &str, globa
     };
     let obj = m.construir(ctor, &args, ctor)?;
     let ms = metodo_do_simbolo(m, obj, s)?;
-    m.chamar(ms, obj, &[t])
+    m.chamar_coletavel(ms, obj, &[t])
 }
 
 fn regex_match(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {

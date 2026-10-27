@@ -21,6 +21,7 @@ pub mod promessas;
 pub mod propriedades;
 pub mod regex;
 pub mod textos;
+mod unicode_tabelas;
 pub mod valor;
 
 pub use funcoes::{Args, Res};

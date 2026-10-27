@@ -267,6 +267,13 @@ fn digitos_curtos(a: f64) -> (String, i32) {
     (d, n)
 }
 
+/// O decimal exato de `a` pode ter até 18 dígitos (só assim há empate entre dois candidatos
+/// mais curtos)? Com f bits fracionários o decimal exato tem pelo menos f dígitos.
+fn pode_empatar(a: f64) -> bool {
+    let (m, e) = decompor(a);
+    e >= 0 || (-e) as u32 - m.trailing_zeros() <= 18
+}
+
 /// Sufixo de expoente "e+N" / "e-N".
 fn expoente(e: i64) -> String {
     format!("e{}{}", if e < 0 { '-' } else { '+' }, e.abs())
@@ -341,6 +348,28 @@ fn digitos_significativos(a: f64, p: usize) -> (Vec<u8>, i64) {
 // ---------------------------------------------------------------- Number::toString
 
 /// Number::toString(x) com raiz 10 (ECMA-262 §6.1.6.1.20).
+/// O texto de `x` entregue a `saida` sem `String` no meio, quando dá: na faixa comum sai direto
+/// da área da pilha; fora dela, do caminho geral.
+pub fn escrever_numero(x: f64, saida: &mut dyn FnMut(&[u8])) {
+    if x.is_finite() && x != 0.0 && (1e-6..1e21).contains(&x.abs()) && !pode_empatar(x.abs()) {
+        struct Area([u8; 40], usize);
+        impl std::fmt::Write for Area {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                let fim = self.1 + s.len();
+                self.0.get_mut(self.1..fim).ok_or(std::fmt::Error)?.copy_from_slice(s.as_bytes());
+                self.1 = fim;
+                Ok(())
+            }
+        }
+        let mut a = Area([0; 40], 0);
+        if std::fmt::Write::write_fmt(&mut a, format_args!("{x}")).is_ok() {
+            saida(&a.0[..a.1]);
+            return;
+        }
+    }
+    saida(numero_para_texto(x).as_bytes());
+}
+
 pub fn numero_para_texto(x: f64) -> String {
     if x.is_nan() {
         return "NaN".to_string();
@@ -351,20 +380,78 @@ pub fn numero_para_texto(x: f64) -> String {
     if x.is_infinite() {
         return String::from(if x > 0.0 { "Infinity" } else { "-Infinity" });
     }
-    let sinal = if x < 0.0 { "-" } else { "" };
-    let (d, n) = digitos_curtos(x.abs());
-    let k = d.len() as i32;
-    let corpo = if k <= n && n <= 21 {
-        format!("{}{}", d, "0".repeat((n - k) as usize))
+    // Dígitos mais curtos de `{:e}` escritos numa área da pilha: uma alocação só, a do resultado.
+    struct Area([u8; 40], usize);
+    impl std::fmt::Write for Area {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            let fim = self.1 + s.len();
+            self.0.get_mut(self.1..fim).ok_or(std::fmt::Error)?.copy_from_slice(s.as_bytes());
+            self.1 = fim;
+            Ok(())
+        }
+    }
+    let mut a = Area([0; 40], 0);
+    // Nesta faixa o `Display` do Rust (dígitos mais curtos, sem expoente) já é o texto do JS.
+    let empate = pode_empatar(x.abs());
+    if !empate && (1e-6..1e21).contains(&x.abs()) {
+        let _ = std::fmt::Write::write_fmt(&mut a, format_args!("{x}"));
+        return std::str::from_utf8(&a.0[..a.1]).unwrap_or_default().to_owned();
+    }
+    let _ = std::fmt::Write::write_fmt(&mut a, format_args!("{:e}", x.abs()));
+    let txt = &a.0[..a.1];
+    let e = txt.iter().position(|&c| c == b'e').unwrap_or(txt.len());
+    let mut d = [0u8; 20];
+    let mut k = 0;
+    for &c in txt[..e].iter().filter(|&&c| c != b'.') {
+        d[k] = c;
+        k += 1;
+    }
+    while k > 1 && d[k - 1] == b'0' {
+        k -= 1;
+    }
+    // Empate: o valor exato tem k + 1 dígitos e termina em 5, então os dois candidatos de k
+    // dígitos ficam à mesma distância. A norma manda o de último dígito par; o Rust sobe.
+    if empate {
+        let (mut ex, _) = decimal_exato(x.abs());
+        while ex.last() == Some(&b'0') {
+            ex.pop();
+        }
+        if ex.len() == k + 1 && ex[k] == b'5' && ex[k - 1] != b'9' {
+            d[..k].copy_from_slice(&ex[..k]);
+            if (ex[k - 1] - b'0') % 2 == 1 {
+                d[k - 1] += 1;
+            }
+        }
+    }
+    let d = &d[..k];
+    let exp: i32 = std::str::from_utf8(&txt[(e + 1).min(txt.len())..]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+    let n = exp + 1;
+    let k = k as i32;
+    let mut r = String::with_capacity(28);
+    if x < 0.0 {
+        r.push('-');
+    }
+    let txt = |r: &mut String, d: &[u8]| d.iter().for_each(|&c| r.push(c as char));
+    if k <= n && n <= 21 {
+        txt(&mut r, d);
+        (0..n - k).for_each(|_| r.push('0'));
     } else if 0 < n && n <= 21 {
-        format!("{}.{}", &d[..n as usize], &d[n as usize..])
+        txt(&mut r, &d[..n as usize]);
+        r.push('.');
+        txt(&mut r, &d[n as usize..]);
     } else if -6 < n && n <= 0 {
-        format!("0.{}{}", "0".repeat((-n) as usize), d)
+        r.push_str("0.");
+        (0..-n).for_each(|_| r.push('0'));
+        txt(&mut r, d);
     } else {
-        let mant = if k == 1 { d.clone() } else { format!("{}.{}", &d[..1], &d[1..]) };
-        format!("{}{}", mant, expoente((n - 1) as i64))
-    };
-    format!("{}{}", sinal, corpo)
+        txt(&mut r, &d[..1]);
+        if k > 1 {
+            r.push('.');
+            txt(&mut r, &d[1..]);
+        }
+        r.push_str(&expoente((n - 1) as i64));
+    }
+    r
 }
 
 /// Dígitos da parte fracionária de m/2^k na base `base`, com a regra de parada
@@ -656,6 +743,10 @@ pub fn para_int32(x: f64) -> i32 {
 
 /// ToUint32 (§7.1.7): trunca e reduz módulo 2^32.
 pub fn para_uint32(x: f64) -> u32 {
+    // Cabe em i64: truncar e cortar os 32 bits de baixo já é o módulo 2^32 (sem fmod).
+    if x.abs() < 9.0e18 {
+        return x as i64 as u32;
+    }
     if !x.is_finite() {
         return 0;
     }
@@ -761,6 +852,15 @@ mod testes {
 
     fn u(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
+    }
+
+    #[test]
+    fn empate_vai_para_o_digito_par() {
+        // Valores exatos ...871,625 e ...981,25: dois candidatos à mesma distância.
+        assert_eq!(numero_para_texto(-138856124132871.625), "-138856124132871.62");
+        assert_eq!(numero_para_texto(956959403119981.25), "956959403119981.2");
+        assert_eq!(numero_para_texto(0.1 + 0.2), "0.30000000000000004");
+        assert_eq!(numero_para_texto(1.0 / 3.0), "0.3333333333333333");
     }
 
     #[test]

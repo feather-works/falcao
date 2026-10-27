@@ -2,7 +2,8 @@
 //!
 //! Campos internos da promessa: `[estado cru][resultado][reações (lista)][tratada cru]`.
 //! Reações em trincas `[ao_cumprir, ao_rejeitar, derivada]`; continuação de async é
-//! `[int(id), BURACO, undefined]`.
+//! `[int(id), BURACO, undefined]`. A derivada é uma promessa nossa ou, quando `then` caiu num
+//! construtor de espécie de fora, a capacidade `[promessa, resolve, reject]` (array do JS).
 
 use crate::formas::{attr, Classe};
 use crate::funcoes::{Args, Res};
@@ -187,7 +188,10 @@ impl Motor {
     /// Par de funções `resolve`/`reject` para a promessa.
     pub fn funcoes_resolucao(&mut self, p: Valor) -> (Valor, Valor) {
         let (r, j) = (self.intr.nativa_resolver, self.intr.nativa_rejeitar);
-        (self.nativa_com(r, 1, p), self.nativa_com(j, 1, p))
+        let c = self.nova_lista(2);
+        self.lista_set(c, 0, p);
+        self.lista_set(c, 1, Valor::FALSE);
+        (self.nativa_com(r, 1, c), self.nativa_com(j, 1, c))
     }
 
     /// Roda as microtarefas até a fila esvaziar.
@@ -209,10 +213,20 @@ impl Motor {
                         derivada = self.raizes.pop().unwrap();
                         r
                     };
-                    if derivada != Valor::UNDEFINED {
+                    if self.e_promessa(derivada) {
                         match r {
                             Ok(v) => self.resolver_promessa(derivada, v),
                             Err(e) => self.rejeitar_promessa(derivada, e),
+                        }
+                    } else if derivada != Valor::UNDEFINED {
+                        let (i, v) = match r {
+                            Ok(v) => (1, v),
+                            Err(e) => (2, e),
+                        };
+                        if let Ok(f) = self.obter_indice(derivada, i) {
+                            if let Err(e) = self.chamar_externo(f, Valor::UNDEFINED, &[v]) {
+                                self.relatar_erro(e);
+                            }
                         }
                     }
                 }
@@ -223,11 +237,11 @@ impl Motor {
                 }
                 Tarefa::Thenable { p, x, then } => {
                     let (res, rej) = self.funcoes_resolucao(p);
-                    self.raizes.push(p);
+                    self.raizes.push(rej);
                     let r = self.chamar_externo(then, x, &[res, rej]);
-                    let p = self.raizes.pop().unwrap();
+                    let rej = self.raizes.pop().unwrap();
                     if let Err(e) = r {
-                        self.rejeitar_promessa(p, e);
+                        let _ = self.chamar_externo(rej, Valor::UNDEFINED, &[e]);
                     }
                 }
                 Tarefa::Funcao { f } => {
@@ -278,8 +292,8 @@ impl Motor {
         self.intr.promessa_proto = proto;
         self.intr.nativa_resolver = self.registrar_nativa("", resolver_nativa, false);
         self.intr.nativa_rejeitar = self.registrar_nativa("", rejeitar_nativa, false);
-        self.intr.nativa_todos = self.registrar_nativa("", todos_elemento, false);
         let ctor = self.nativa("Promise", 1, construtor, true);
+        self.intr.promessa_ctor = ctor;
         self.definir_propria(ctor, fixos::PROTOTYPE, proto, 0);
         self.definir_propria(proto, fixos::CONSTRUCTOR, ctor, attr::METODO);
         let tag = self.texto("Promise");
@@ -294,6 +308,9 @@ impl Motor {
         self.metodo(ctor, "race", 1, race);
         self.metodo(ctor, "any", 1, any);
         self.metodo(ctor, "withResolvers", 0, with_resolvers);
+        self.metodo(ctor, "try", 1, try_);
+        self.metodo(ctor, "allKeyed", 1, all_keyed);
+        self.metodo(ctor, "allSettledKeyed", 1, all_settled_keyed);
         let g = self.intr.global;
         let c = self.chave("Promise");
         self.definir_propria(g, c, ctor, attr::METODO);
@@ -301,17 +318,29 @@ impl Motor {
     }
 }
 
+/// A promessa da célula `[promessa, já resolvida]` do par, ou None se o par já foi usado.
+fn tomar_celula(m: &mut Motor) -> Option<Valor> {
+    let c = m.capturado();
+    if m.lista_get(c, 1) == Valor::TRUE {
+        return None;
+    }
+    m.lista_set(c, 1, Valor::TRUE);
+    Some(m.lista_get(c, 0))
+}
+
 fn resolver_nativa(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
-    let p = m.capturado();
-    let x = m.arg(a, 0);
-    m.resolver_promessa(p, x);
+    if let Some(p) = tomar_celula(m) {
+        let x = m.arg(a, 0);
+        m.resolver_promessa(p, x);
+    }
     Ok(Valor::UNDEFINED)
 }
 
 fn rejeitar_nativa(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
-    let p = m.capturado();
-    let x = m.arg(a, 0);
-    m.rejeitar_promessa(p, x);
+    if let Some(p) = tomar_celula(m) {
+        let x = m.arg(a, 0);
+        m.rejeitar_promessa(p, x);
+    }
     Ok(Valor::UNDEFINED)
 }
 
@@ -329,7 +358,7 @@ fn construtor(m: &mut Motor, _this: Valor, a: Args, nt: Valor) -> Res<Valor> {
     let p = m.promessa_com_proto(proto);
     let (res, rej) = m.funcoes_resolucao(p);
     if let Err(e) = m.chamar(exec, Valor::UNDEFINED, &[res, rej]) {
-        m.rejeitar_promessa(p, e);
+        m.chamar(rej, Valor::UNDEFINED, &[e])?;
     }
     Ok(p)
 }
@@ -342,10 +371,38 @@ fn exigir_promessa(m: &mut Motor, v: Valor) -> Res<()> {
     }
 }
 
+/// SpeciesConstructor(o, %Promise%).
+fn especie(m: &mut Motor, o: Valor) -> Res<Valor> {
+    let padrao = m.intr.promessa_ctor;
+    let c = m.obter(o, ChaveProp::Nome(fixos::CONSTRUCTOR))?;
+    if c == Valor::UNDEFINED {
+        return Ok(padrao);
+    }
+    if !m.e_objeto(c) {
+        return m.erro_tipo("object.constructor is not an object");
+    }
+    let sp = m.obter(c, ChaveProp::Nome(crate::intrinsecos::simb::SPECIES))?;
+    if sp == Valor::UNDEFINED || sp == Valor::NULL {
+        return Ok(padrao);
+    }
+    if m.e_construtor(sp) {
+        return Ok(sp);
+    }
+    m.erro_tipo("object.constructor[Symbol.species] is not a constructor")
+}
+
 fn then(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     exigir_promessa(m, this)?;
+    let c = especie(m, this)?;
     let (ok, err) = (m.arg(a, 0), m.arg(a, 1));
-    Ok(m.entao(this, ok, err))
+    if c == m.intr.promessa_ctor {
+        return Ok(m.entao(this, ok, err));
+    }
+    let cap = chamar_js(m, JS_CAPACIDADE, &[c])?;
+    let ok = if m.e_funcao(ok) { ok } else { Valor::UNDEFINED };
+    let err = if m.e_funcao(err) { err } else { Valor::UNDEFINED };
+    m.adicionar_reacao(this, ok, err, cap);
+    m.obter_indice(cap, 0)
 }
 
 fn catch(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
@@ -354,178 +411,316 @@ fn catch(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     m.chamar(t, this, &[Valor::UNDEFINED, f])
 }
 
-fn finally_ok(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
-    let f = m.capturado();
-    let r = m.chamar(f, Valor::UNDEFINED, &[])?;
-    let v = m.arg(a, 0);
-    // shortcut: não espera a promessa que o tratador do finally devolve.
-    let _ = r;
-    Ok(v)
+// ---------------------------------------------------------------- partes em JS
+
+// Índices na lista que PROMESSA_JS devolve.
+const JS_CAPACIDADE: u32 = 0;
+const JS_ALL: u32 = 1;
+const JS_ALL_SETTLED: u32 = 2;
+const JS_ANY: u32 = 3;
+const JS_RACE: u32 = 4;
+const JS_ALL_KEYED: u32 = 5;
+const JS_ALL_SETTLED_KEYED: u32 = 6;
+const JS_TRY: u32 = 7;
+const JS_RESOLVE: u32 = 8;
+const JS_REJECT: u32 = 9;
+const JS_WITH_RESOLVERS: u32 = 10;
+const JS_FINALLY: u32 = 11;
+
+/// Os combinadores, `finally` e os estáticos que aceitam qualquer construtor em `this`
+/// (NewPromiseCapability). Só ajudantes nativos capturados: mexer no global não muda nada.
+/// As funções que o usuário vê (elementos, executor, thenFinally) passam por `anon` para
+/// nascerem sem nome, como pede a especificação.
+const PROMESSA_JS: &str = r#"(function (eConstrutor, eObjeto, ePromessa, definir, chamar, erroTipo, erroAgregado, especie, chaves, enumeravel, objetoNulo, ITERADOR) {
+'use strict';
+const anon = f => f;
+const FIM = [];
+function capacidade(C) {
+  if (!eConstrutor(C)) throw erroTipo('Promise capability: not a constructor');
+  let res, rej;
+  const p = new C(anon((a, b) => {
+    if (res !== undefined) throw erroTipo('Promise executor has already been invoked with non-undefined arguments');
+    if (rej !== undefined) throw erroTipo('Promise executor has already been invoked with non-undefined arguments');
+    res = a;
+    rej = b;
+  }));
+  if (typeof res !== 'function') throw erroTipo('Promise resolve function is not callable');
+  if (typeof rej !== 'function') throw erroTipo('Promise reject function is not callable');
+  return [p, res, rej];
+}
+function resolverCom(C, x) {
+  if (ePromessa(x) && x.constructor === C) return x;
+  const cap = capacidade(C);
+  chamar(cap[1], undefined, [x]);
+  return cap[0];
+}
+function rejeitar(cap, e) {
+  chamar(cap[2], undefined, [e]);
+  return cap[0];
+}
+function obterResolve(C) {
+  const r = C.resolve;
+  if (typeof r !== 'function') throw erroTipo('Promise resolve is not a function');
+  return r;
+}
+function copia(l) {
+  const a = [];
+  for (let k = 0; k < l.length; k++) definir(a, k, l[k]);
+  return a;
+}
+// reg = [iterador, next, feito]; qualquer erro ao andar deixa feito = true (não fecha).
+function passo(reg) {
+  reg[2] = true;
+  const r = chamar(reg[1], reg[0], []);
+  if (!eObjeto(r)) throw erroTipo('Iterator result is not an object');
+  if (r.done) return FIM;
+  const v = r.value;
+  reg[2] = false;
+  return v;
+}
+function fechar(reg) {
+  try { const f = reg[0].return; if (f !== undefined && f !== null) chamar(f, reg[0], []); } catch (_) {}
+}
+function combinador(C, iteravel, laco) {
+  const cap = capacidade(C);
+  let pr, reg;
+  try {
+    pr = obterResolve(C);
+    const f = iteravel[ITERADOR];
+    if (typeof f !== 'function') throw erroTipo('object is not iterable');
+    const it = chamar(f, iteravel, []);
+    if (!eObjeto(it)) throw erroTipo('Result of the Symbol.iterator method is not an object');
+    reg = [it, it.next, false];
+  } catch (e) {
+    return rejeitar(cap, e);
+  }
+  try {
+    laco(C, cap, pr, reg);
+  } catch (e) {
+    if (!reg[2]) fechar(reg);
+    return rejeitar(cap, e);
+  }
+  return cap[0];
+}
+// modo: 0 all, 1 allSettled, 2 any. `proximo()` devolve [chave, valor] ou FIM.
+function juntar(C, cap, pr, modo, proximo, acabou) {
+  const valores = [];
+  const nomes = [];
+  let restante = 1;
+  const pronto = () => {
+    if (modo === 2) chamar(cap[2], undefined, [erroAgregado(copia(valores))]);
+    else chamar(cap[1], undefined, [acabou(nomes, valores)]);
+  };
+  for (let i = 0; ; i++) {
+    const kv = proximo();
+    if (kv === FIM) break;
+    definir(nomes, i, kv[0]);
+    definir(valores, i, undefined);
+    const prox = chamar(pr, C, [kv[1]]);
+    let chamado = false;
+    const elemento = (tipo) => anon((x) => {
+      if (chamado) return undefined;
+      chamado = true;
+      definir(valores, i, tipo === 0 ? x : tipo === 1 ? { status: 'fulfilled', value: x } : { status: 'rejected', reason: x });
+      if (--restante === 0) pronto();
+    });
+    restante++;
+    if (modo === 0) prox.then(elemento(0), cap[2]);
+    else if (modo === 1) prox.then(elemento(1), elemento(2));
+    else prox.then(cap[1], elemento(0));
+  }
+  if (--restante === 0) {
+    if (modo === 2) throw erroAgregado(copia(valores));
+    chamar(cap[1], undefined, [acabou(nomes, valores)]);
+  }
+}
+const comoArray = (nomes, valores) => copia(valores);
+function comoObjeto(nomes, valores) {
+  const o = objetoNulo();
+  for (let k = 0; k < nomes.length; k++) definir(o, nomes[k], valores[k]);
+  return o;
+}
+const deIterador = (reg) => () => { const v = passo(reg); return v === FIM ? FIM : [undefined, v]; };
+function todos(modo) {
+  return (C, iteravel) => combinador(C, iteravel, (C, cap, pr, reg) => juntar(C, cap, pr, modo, deIterador(reg), comoArray));
+}
+function chaveado(modo) {
+  return (C, o) => {
+    const cap = capacidade(C);
+    try {
+      const pr = obterResolve(C);
+      if (!eObjeto(o)) throw erroTipo('Promise.allKeyed: argument is not an object');
+      const ks = chaves(o);
+      let j = 0;
+      const proximo = () => {
+        while (j < ks.length) {
+          const k = ks[j++];
+          if (enumeravel(o, k)) return [k, o[k]];
+        }
+        return FIM;
+      };
+      juntar(C, cap, pr, modo, proximo, comoObjeto);
+    } catch (e) {
+      return rejeitar(cap, e);
+    }
+    return cap[0];
+  };
+}
+function race(C, iteravel) {
+  return combinador(C, iteravel, (C, cap, pr, reg) => {
+    for (;;) {
+      const v = passo(reg);
+      if (v === FIM) return;
+      chamar(pr, C, [v]).then(cap[1], cap[2]);
+    }
+  });
+}
+// Valor normal passa por PromiseResolve: uma promessa de C volta sem embrulho.
+function tentar(C, f, args) {
+  if (!eObjeto(C)) throw erroTipo('Promise.try called on non-object');
+  let s;
+  try { s = chamar(f, undefined, args); } catch (e) { return rejeitar(capacidade(C), e); }
+  return resolverCom(C, s);
+}
+function resolve(C, x) {
+  if (!eObjeto(C)) throw erroTipo('Promise.resolve called on non-object');
+  return resolverCom(C, x);
+}
+function reject(C, r) {
+  return rejeitar(capacidade(C), r);
+}
+function withResolvers(C) {
+  const cap = capacidade(C);
+  return { promise: cap[0], resolve: cap[1], reject: cap[2] };
+}
+function aoFim(p, f) {
+  if (!eObjeto(p)) throw erroTipo('Promise.prototype.finally called on non-object');
+  const C = especie(p);
+  let ok = f, err = f;
+  if (typeof f === 'function') {
+    ok = anon((valor) => resolverCom(C, chamar(f, undefined, [])).then(anon(() => valor)));
+    err = anon((motivo) => resolverCom(C, chamar(f, undefined, [])).then(anon(() => { throw motivo; })));
+  }
+  return p.then(ok, err);
+}
+return [capacidade, todos(0), todos(1), todos(2), race, chaveado(0), chaveado(1), tentar, resolve, reject, withResolvers, aoFim];
+})"#;
+
+/// Chama a parte `i` de PROMESSA_JS (compila no primeiro uso).
+fn chamar_js(m: &mut Motor, i: u32, args: &[Valor]) -> Res<Valor> {
+    if m.intr.promessa_js == Valor::UNDEFINED {
+        let fabrica = {
+            let p = m.compilar_texto(PROMESSA_JS)?;
+            m.executar(p)?
+        };
+        use crate::builtins::assincronos as aj;
+        let ajudantes: [(&'static str, crate::funcoes::FnNativa); 11] = [
+            ("e_construtor", aj::fa_e_construtor),
+            ("e_objeto", aj::fa_e_objeto),
+            ("e_promessa", js_e_promessa),
+            ("definir", aj::fa_definir),
+            ("chamar", aj::fa_chamar),
+            ("erro_tipo", js_erro_tipo),
+            ("erro_agregado", js_erro_agregado),
+            ("especie", js_especie),
+            ("chaves", js_chaves),
+            ("enumeravel", js_enumeravel),
+            ("objeto_nulo", js_objeto_nulo),
+        ];
+        let mut a: Vec<Valor> = ajudantes.iter().map(|&(n, f)| m.nativa(n, 0, f, false)).collect();
+        a.push(m.chave_para_valor(ChaveProp::Nome(crate::intrinsecos::simb::ITERATOR)));
+        m.intr.promessa_js = m.chamar(fabrica, Valor::UNDEFINED, &a)?;
+    }
+    let l = m.intr.promessa_js;
+    let f = m.obter_indice(l, u64::from(i))?;
+    m.chamar(f, Valor::UNDEFINED, args)
 }
 
-fn finally_err(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
-    let f = m.capturado();
-    m.chamar(f, Valor::UNDEFINED, &[])?;
-    Err(m.arg(a, 0))
+fn js_e_promessa(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    Ok(Valor::bool(m.e_promessa(m.arg(a, 0))))
+}
+
+fn js_erro_tipo(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    let msg = m.para_texto_rust(m.arg(a, 0))?;
+    Ok(m.erro(crate::intrinsecos::TipoErro::Tipo, &msg))
+}
+
+fn js_erro_agregado(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    let e = m.erro(crate::intrinsecos::TipoErro::Agregado, "All promises were rejected");
+    let l = m.arg(a, 0);
+    m.definir_propria(e, fixos::ERRORS, l, attr::METODO);
+    Ok(e)
+}
+
+fn js_especie(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    especie(m, m.arg(a, 0))
+}
+
+fn js_chaves(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    let ks = m.chaves_de(m.arg(a, 0), false, true, true);
+    let vs: Vec<Valor> = ks.into_iter().map(|k| m.chave_para_valor(k)).collect();
+    Ok(m.array_de(&vs))
+}
+
+fn js_enumeravel(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    let k = m.para_chave(m.arg(a, 1))?;
+    let d = m.descritor_proprio(m.arg(a, 0), k);
+    Ok(Valor::bool(d.is_some_and(|d| d.attrs & attr::ENUMERAVEL != 0)))
+}
+
+fn js_objeto_nulo(m: &mut Motor, _this: Valor, _a: Args, _nt: Valor) -> Res<Valor> {
+    let f = m.forma_para(Classe::Comum, Valor::NULL, 0);
+    Ok(m.novo_objeto(f))
 }
 
 fn finally(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
-    let f = m.arg(a, 0);
-    let t = m.obter(this, ChaveProp::Nome(fixos::THEN))?;
-    if !m.e_funcao(f) {
-        return m.chamar(t, this, &[f, f]);
-    }
-    let i1 = m.id_nativa("finally_ok", finally_ok);
-    let i2 = m.id_nativa("finally_err", finally_err);
-    let ok = m.nativa_com(i1, 1, f);
-    let err = m.nativa_com(i2, 1, f);
-    m.chamar(t, this, &[ok, err])
+    chamar_js(m, JS_FINALLY, &[this, m.arg(a, 0)])
 }
 
-fn resolve(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+fn resolve(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     let v = m.arg(a, 0);
-    Ok(m.promessa_de(v))
-}
-
-fn reject(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
-    let p = m.nova_promessa();
-    let e = m.arg(a, 0);
-    m.rejeitar_promessa(p, e);
-    Ok(p)
-}
-
-fn with_resolvers(m: &mut Motor, _this: Valor, _a: Args, _nt: Valor) -> Res<Valor> {
-    let p = m.nova_promessa();
-    let (res, rej) = m.funcoes_resolucao(p);
-    let o = m.objeto_vazio();
-    let kp = m.chave("promise");
-    let kr = m.chave("resolve");
-    let kj = m.chave("reject");
-    m.definir_propria(o, kp, p, attr::PADRAO);
-    m.definir_propria(o, kr, res, attr::PADRAO);
-    m.definir_propria(o, kj, rej, attr::PADRAO);
-    Ok(o)
-}
-
-// Estado comum de all/allSettled/any: lista [resultados (array), restantes (int), derivada, modo].
-const MODO_ALL: i32 = 0;
-const MODO_SETTLED_OK: i32 = 1;
-const MODO_SETTLED_ERR: i32 = 2;
-const MODO_ANY: i32 = 3;
-
-/// Tratador de um item: captura `[estado, índice, modo]`.
-fn todos_elemento(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
-    let cap = m.capturado();
-    let (estado, i, modo) = (m.lista_get(cap, 0), m.lista_get(cap, 1).como_int() as u32, m.lista_get(cap, 2).como_int());
-    if m.lista_get(cap, 3) == Valor::TRUE {
-        return Ok(Valor::UNDEFINED);
+    if this == m.intr.promessa_ctor {
+        return m.promessa_resolve(v);
     }
-    m.lista_set(cap, 3, Valor::TRUE);
-    let v = m.arg(a, 0);
-    let item = match modo {
-        MODO_SETTLED_OK | MODO_SETTLED_ERR => {
-            let o = m.objeto_vazio();
-            let ks = m.chave("status");
-            let (st, kv) = if modo == MODO_SETTLED_OK { ("fulfilled", fixos::VALUE) } else { ("rejected", m.chave("reason")) };
-            let st = m.texto(st);
-            m.definir_propria(o, ks, st, attr::PADRAO);
-            m.definir_propria(o, kv, v, attr::PADRAO);
-            o
-        }
-        _ => v,
-    };
-    let res = m.lista_get(estado, 0);
-    m.gravar_elemento(res, i, item);
-    let n = m.lista_get(estado, 1).como_int() - 1;
-    m.lista_set(estado, 1, Valor::int(n));
-    if n == 0 {
-        let d = m.lista_get(estado, 2);
-        if modo == MODO_ANY {
-            let e = m.erro(crate::intrinsecos::TipoErro::Agregado, "All promises were rejected");
-            m.definir_propria(e, fixos::ERRORS, res, attr::METODO);
-            m.rejeitar_promessa(d, e);
-        } else {
-            m.resolver_promessa(d, res);
-        }
-    }
-    Ok(Valor::UNDEFINED)
+    chamar_js(m, JS_RESOLVE, &[this, v])
 }
 
-fn combinar(m: &mut Motor, a: Args, modo: i32) -> Res<Valor> {
-    let d = m.nova_promessa();
-    let itens = match m.coletar_iteravel(m.arg(a, 0)) {
-        Ok(i) => i,
-        Err(e) => {
-            m.rejeitar_promessa(d, e);
-            return Ok(d);
-        }
-    };
-    let res = m.array_de(&[]);
-    if !itens.is_empty() {
-        m.definir_array_len(res, itens.len() as u32);
-    }
-    let estado = m.nova_lista(4);
-    m.lista_set(estado, 0, res);
-    m.lista_set(estado, 1, Valor::int(itens.len() as i32));
-    m.lista_set(estado, 2, d);
-    if itens.is_empty() {
-        if modo == MODO_ANY {
-            let e = m.erro(crate::intrinsecos::TipoErro::Agregado, "All promises were rejected");
-            m.rejeitar_promessa(d, e);
-        } else {
-            m.resolver_promessa(d, res);
-        }
-        return Ok(d);
-    }
-    let id = m.intr.nativa_todos;
-    let (rr, rj) = m.funcoes_resolucao(d);
-    for (i, x) in itens.into_iter().enumerate() {
-        let p = m.promessa_de(x);
-        let cap = |m: &mut Motor, modo: i32| {
-            let c = m.nova_lista(4);
-            m.lista_set(c, 0, estado);
-            m.lista_set(c, 1, Valor::int(i as i32));
-            m.lista_set(c, 2, Valor::int(modo));
-            m.lista_set(c, 3, Valor::FALSE);
-            m.nativa_com(id, 1, c)
-        };
-        let (ok, err) = match modo {
-            MODO_ALL => (cap(m, MODO_ALL), rj),
-            MODO_ANY => (rr, cap(m, MODO_ANY)),
-            _ => (cap(m, MODO_SETTLED_OK), cap(m, MODO_SETTLED_ERR)),
-        };
-        m.entao(p, ok, err);
-    }
-    Ok(d)
+fn reject(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    chamar_js(m, JS_REJECT, &[this, m.arg(a, 0)])
 }
 
-fn all(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
-    combinar(m, a, MODO_ALL)
+fn with_resolvers(m: &mut Motor, this: Valor, _a: Args, _nt: Valor) -> Res<Valor> {
+    chamar_js(m, JS_WITH_RESOLVERS, &[this])
 }
 
-fn all_settled(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
-    combinar(m, a, MODO_SETTLED_OK)
+fn try_(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    let resto: Vec<Valor> = (1..a.n).map(|i| m.arg(a, i)).collect();
+    let resto = m.array_de(&resto);
+    chamar_js(m, JS_TRY, &[this, m.arg(a, 0), resto])
 }
 
-fn any(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
-    combinar(m, a, MODO_ANY)
+fn all(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    chamar_js(m, JS_ALL, &[this, m.arg(a, 0)])
 }
 
-fn race(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
-    let d = m.nova_promessa();
-    let itens = match m.coletar_iteravel(m.arg(a, 0)) {
-        Ok(i) => i,
-        Err(e) => {
-            m.rejeitar_promessa(d, e);
-            return Ok(d);
-        }
-    };
-    let (rr, rj) = m.funcoes_resolucao(d);
-    for x in itens {
-        let p = m.promessa_de(x);
-        m.entao(p, rr, rj);
-    }
-    Ok(d)
+fn all_settled(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    chamar_js(m, JS_ALL_SETTLED, &[this, m.arg(a, 0)])
+}
+
+fn any(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    chamar_js(m, JS_ANY, &[this, m.arg(a, 0)])
+}
+
+fn race(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    chamar_js(m, JS_RACE, &[this, m.arg(a, 0)])
+}
+
+fn all_keyed(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    chamar_js(m, JS_ALL_KEYED, &[this, m.arg(a, 0)])
+}
+
+fn all_settled_keyed(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
+    chamar_js(m, JS_ALL_SETTLED_KEYED, &[this, m.arg(a, 0)])
 }
 
 fn queue_microtask(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {

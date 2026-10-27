@@ -161,7 +161,12 @@ impl Motor {
             Ok((arvore, lexico)) => {
                 let esc = falcao_sintaxe::analisar_escopos(&arvore);
                 match falcao_bytecode::compilar(&arvore, &esc, &lexico) {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        if let Err(m) = crate::regex::validar_literais(&s) {
+                            return Err(self.erro(TipoErro::Sintaxe, &format!("{url}: Invalid regular expression: {m}")));
+                        }
+                        s
+                    }
                     Err(e) => return Err(self.erro(TipoErro::Sintaxe, &format!("{url}: {}", e.mensagem))),
                 }
             }

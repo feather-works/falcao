@@ -42,6 +42,8 @@ pub(crate) enum Destino {
 pub(crate) enum Saida {
     Contexto,
     Iterador(u32),
+    /// `for await`: (registro do iterador, registro onde o acc espera o fechamento).
+    IteradorAsync(u32, u32),
     Finally {
         tipo: u32,
         valor: u32,
@@ -58,6 +60,8 @@ pub(crate) struct Alvo {
     pub continua: Option<Rotulo>,
     /// `saidas.len()` na entrada.
     pub nivel: usize,
+    /// Até onde o `break` desfaz: em for-of inclui o iterador do próprio laço (fecha ele).
+    pub nivel_quebra: usize,
 }
 
 /// Estado da função sendo gerada.
@@ -113,6 +117,9 @@ impl Func {
 
 /// Compila um script já analisado (árvore + escopos).
 pub fn compilar(arv: &Arvore, esc: &Escopos, lex: &Lexico<'_>) -> R<Script> {
+    if let Some(a) = esc.erro {
+        return Err(ErroCompilacao { posicao: 0, mensagem: format!("Identifier '{}' has already been declared", lex.atomos.texto(a)) });
+    }
     let raiz = esc.raiz.expect("escopos sem raiz");
     let flags = Flags { estrita: arv.estrito, topo: true, assincrona: arv.modulo && arv.await_topo, ..Flags::default() };
     let mut c = Compilador {
@@ -350,7 +357,7 @@ impl<'a> Compilador<'a> {
         self.locais.get(&v.0).copied()
     }
 
-    fn lexico(&self, v: VinculoId) -> bool {
+    pub(crate) fn lexico(&self, v: VinculoId) -> bool {
         matches!(self.esc.vinculo(v).tipo, TipoVinculo::Let | TipoVinculo::Const | TipoVinculo::Classe)
     }
 
@@ -408,6 +415,16 @@ impl<'a> Compilador<'a> {
     pub(crate) fn ler_nome(&mut self, no: NoId, a: Atomo, typeof_: bool) {
         match self.esc.referencia(no) {
             Some(Ref::Vinculo(v)) => self.ler_vinculo(v, a),
+            Some(Ref::Com(v)) => {
+                let (senao, fim) = self.tem_com(v, a);
+                let k = self.k_nome(a);
+                let op = if typeof_ { Op::LeDinamicoTypeof } else { Op::LeDinamico };
+                self.op(op, &[Arg::U(k), Arg::Cache]);
+                self.salta(Op::Salta, fim);
+                self.por(senao);
+                self.ler_vinculo(v, a);
+                self.por(fim);
+            }
             Some(Ref::Dinamico) => {
                 let k = self.k_nome(a);
                 let op = if typeof_ { Op::LeDinamicoTypeof } else { Op::LeDinamico };
@@ -425,45 +442,77 @@ impl<'a> Compilador<'a> {
         }
     }
 
+    /// Testa se um objeto de `with` entre aqui e o contexto do vínculo `v` tem o nome; salta para
+    /// o primeiro rótulo devolvido se não tem (aí vale o vínculo). O segundo é o fim.
+    fn tem_com(&mut self, v: VinculoId, a: Atomo) -> (Rotulo, Rotulo) {
+        let n = match self.local(v) {
+            Some(Local::Ctx { escopo, .. }) => self.profundidade(escopo),
+            // Não deveria acontecer (o vínculo alcançado por `with` mora em contexto): olha todos.
+            _ => 0xffff,
+        };
+        let k = self.k_nome(a);
+        self.op(Op::TemCom, &[Arg::U(k), Arg::U(n)]);
+        let (senao, fim) = (self.rotulo(), self.rotulo());
+        self.salta(Op::SaltaSeFalso, senao);
+        (senao, fim)
+    }
+
+    /// `gravar_nome` num vínculo conhecido.
+    fn gravar_nome_vinculo(&mut self, _no: NoId, v: VinculoId, a: Atomo, declarando: bool) {
+        let vin = *self.esc.vinculo(v);
+        if !declarando && vin.tipo == TipoVinculo::Const {
+            let k = self.k_nome(a);
+            // Ler antes dá ReferenceError se estiver em TDZ, como manda a norma.
+            let t = self.temp();
+            self.op(Op::Guarda, &[Arg::U(t)]);
+            self.ler_vinculo(v, a);
+            self.liberar(t);
+            self.op(Op::GravaConst, &[Arg::U(k)]);
+            return;
+        }
+        if vin.tipo == TipoVinculo::NomeFuncao && !declarando {
+            // Nome de expressão de função é só leitura (no estrito, TypeError).
+            if self.f.flags.estrita {
+                let k = self.k_nome(a);
+                self.op(Op::GravaConst, &[Arg::U(k)]);
+            }
+            return;
+        }
+        if !declarando && self.lexico(v) && !self.f.iniciados.contains_key(&v.0) {
+            // `x = 1` antes do `let x`: confere a TDZ sem perder o acc.
+            let t = self.temp();
+            self.op(Op::Guarda, &[Arg::U(t)]);
+            self.ler_vinculo(v, a);
+            self.op(Op::Carrega, &[Arg::U(t)]);
+            self.liberar(t);
+        }
+        self.gravar_local(v, declarando);
+        if declarando {
+            self.iniciado(v);
+        }
+    }
+
     /// nome = acc (atribuição comum: `x = 1`, `x += 1`). `declarando`: é a declaração.
     pub(crate) fn gravar_nome(&mut self, no: NoId, a: Atomo, declarando: bool) {
         match self.esc.referencia(no) {
-            Some(Ref::Vinculo(v)) => {
-                let vin = *self.esc.vinculo(v);
-                if !declarando && vin.tipo == TipoVinculo::Const {
-                    let k = self.k_nome(a);
-                    // Ler antes dá ReferenceError se estiver em TDZ, como manda a norma.
-                    let t = self.temp();
-                    self.op(Op::Guarda, &[Arg::U(t)]);
-                    self.ler_vinculo(v, a);
-                    self.liberar(t);
-                    self.op(Op::GravaConst, &[Arg::U(k)]);
-                    return;
-                }
-                if vin.tipo == TipoVinculo::NomeFuncao && !declarando {
-                    // Nome de expressão de função é só leitura (no estrito, TypeError).
-                    if self.f.flags.estrita {
-                        let k = self.k_nome(a);
-                        self.op(Op::GravaConst, &[Arg::U(k)]);
-                    }
-                    return;
-                }
-                if !declarando && self.lexico(v) && !self.f.iniciados.contains_key(&v.0) {
-                    // `x = 1` antes do `let x`: confere a TDZ sem perder o acc.
-                    let t = self.temp();
-                    self.op(Op::Guarda, &[Arg::U(t)]);
-                    self.ler_vinculo(v, a);
-                    self.op(Op::Carrega, &[Arg::U(t)]);
-                    self.liberar(t);
-                }
-                self.gravar_local(v, declarando);
-                if declarando {
-                    self.iniciado(v);
-                }
-            }
+            Some(Ref::Vinculo(v)) => self.gravar_nome_vinculo(no, v, a, declarando),
             Some(Ref::Dinamico) => {
                 let k = self.k_nome(a);
                 self.op(Op::GravaDinamico, &[Arg::U(k), Arg::Cache]);
+            }
+            Some(Ref::Com(v)) => {
+                let t = self.temp();
+                self.op(Op::Guarda, &[Arg::U(t)]);
+                let (senao, fim) = self.tem_com(v, a);
+                let k = self.k_nome(a);
+                self.op(Op::Carrega, &[Arg::U(t)]);
+                self.op(Op::GravaDinamico, &[Arg::U(k), Arg::Cache]);
+                self.salta(Op::Salta, fim);
+                self.por(senao);
+                self.op(Op::Carrega, &[Arg::U(t)]);
+                self.liberar(t);
+                self.gravar_nome_vinculo(no, v, a, declarando);
+                self.por(fim);
             }
             Some(Ref::Global) | None => {
                 let k = self.k_nome(a);
@@ -488,6 +537,16 @@ impl<'a> Compilador<'a> {
                 Saida::Iterador(r) => {
                     let r = *r;
                     self.op(Op::FechaIterador, &[Arg::U(r)]);
+                }
+                Saida::IteradorAsync(r, g) => {
+                    let (r, g) = (*r, *g);
+                    let pula = self.rotulo();
+                    self.op(Op::Guarda, &[Arg::U(g)]);
+                    self.op(Op::FechaIteradorAsync, &[Arg::U(r), Arg::Para(pula)]);
+                    self.op0(Op::Aguarda);
+                    self.op0(Op::ExigeObjeto);
+                    self.por(pula);
+                    self.op(Op::Carrega, &[Arg::U(g)]);
                 }
                 Saida::Finally { tipo, valor, entrada, saltos } => {
                     let id = saltos.len() as u32 + 2;
@@ -534,8 +593,8 @@ impl<'a> Compilador<'a> {
                 let vin = *self.esc.vinculo(v);
                 let k = self.k_nome(vin.nome);
                 match vin.tipo {
-                    TipoVinculo::Let => self.op(Op::DeclaraGlobalLexico, &[Arg::U(k), Arg::U(0)]),
-                    TipoVinculo::Const | TipoVinculo::Classe => self.op(Op::DeclaraGlobalLexico, &[Arg::U(k), Arg::U(1)]),
+                    TipoVinculo::Let | TipoVinculo::Classe => self.op(Op::DeclaraGlobalLexico, &[Arg::U(k), Arg::U(0)]),
+                    TipoVinculo::Const => self.op(Op::DeclaraGlobalLexico, &[Arg::U(k), Arg::U(1)]),
                     TipoVinculo::Funcao => {}
                     _ => self.op(Op::DeclaraGlobal, &[Arg::U(k), Arg::U(0)]),
                 }
@@ -786,11 +845,6 @@ impl<'a> Compilador<'a> {
             (e, base)
         });
         let base = self.entrar_escopo(escopo);
-        if fl.gerador || fl.assincrona {
-            if fl.gerador {
-                self.op0(Op::IniciaGerador);
-            }
-        }
         // `arguments`.
         if let Some(&v) = self.esc.escopo(escopo).vinculos.iter().find(|&&v| self.esc.vinculo(v).tipo == falcao_sintaxe::TipoVinculo::Arguments) {
             // shortcut: arguments nunca é mapeado aos parâmetros (mudar um não muda o outro).
@@ -827,6 +881,11 @@ impl<'a> Compilador<'a> {
             }
         }
         self.icar_funcoes(func.corpo)?;
+        // Gerador: parâmetros e funções içadas rodam na chamada (erro neles lança ali); o objeto
+        // do gerador nasce depois e o corpo espera o primeiro `next`.
+        if fl.gerador {
+            self.op0(Op::IniciaGerador);
+        }
         let corpo = func.corpo;
         self.lista_comandos(corpo)?;
         self.sair_escopo(escopo, base);

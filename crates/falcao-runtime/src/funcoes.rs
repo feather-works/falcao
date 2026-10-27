@@ -51,34 +51,72 @@ pub enum ConstRt {
     Regex,
 }
 
-/// Cache inline de propriedade (monomórfico; ver `ARQUITETURA.md`, seção 8).
+/// Cache inline de propriedade (`ARQUITETURA.md`, seção 8). A entrada daqui é a primeira forma
+/// vista (monomórfico); as seguintes vão para `Motor::poli` (até 4 formas no total) e, passando
+/// disso, o site fica megamórfico e usa a tabela global `Motor::mega` (forma × nome).
 #[derive(Clone, Copy, Debug)]
 pub struct CacheProp {
     /// Forma do receptor (u32::MAX = vazio).
     pub forma: u32,
-    /// Campo na linha (offset em bytes desde o objeto) ou, com `extras`, índice em extras.
+    /// Slot do campo (ver `Motor::ler_campo`).
     pub deslocamento: u32,
-    pub extras: bool,
     /// Achado no protótipo: o objeto que tem a propriedade e a forma dele.
     pub dono: Valor,
     pub forma_dono: u32,
+    /// Índice em `Motor::poli`, [`SEM_POLI`] ou [`MEGA`].
+    pub poli: u32,
 }
+
+pub const SEM_POLI: u32 = u32::MAX;
+pub const MEGA: u32 = u32::MAX - 1;
 
 impl Default for CacheProp {
     fn default() -> Self {
-        Self { forma: u32::MAX, deslocamento: 0, extras: false, dono: Valor::UNDEFINED, forma_dono: u32::MAX }
+        Self { forma: u32::MAX, deslocamento: 0, dono: Valor::UNDEFINED, forma_dono: u32::MAX, poli: SEM_POLI }
     }
 }
+
+/// Feedback de tipos (`Proto::tipos`): o OR do que cada instrução de conta ou comparação já
+/// viu nos operandos, para o N2/N3 escolher o caminho rápido e as guardas (seções 8 e 11).
+/// O caminho rápido (inteiro com inteiro, sem estouro) não anota, para não pesar no laço: 0 é
+/// "só inteiros, ou não rodou" — numa função quente o N2 aposta em inteiro com guarda, como o
+/// feedback vazio do V8. `INT` aparece quando o inteiro veio misturado com outro tipo.
+pub mod tipo {
+    pub const INT: u8 = 1;
+    pub const DOUBLE: u8 = 2;
+    pub const TEXTO: u8 = 4;
+    pub const BIGINT: u8 = 8;
+    /// undefined, null, booleano, símbolo, objeto.
+    pub const OUTRO: u8 = 16;
+    /// Entrou inteiro e o resultado não coube em 31 bits (estouro, divisão com resto).
+    pub const ESTOUROU: u8 = 32;
+    /// Bits 6-7: anotações seguidas sem tipo novo; com as duas ligadas (`>= ESTAVEL`) o caminho
+    /// lento para de anotar. shortcut: tipo que só aparece depois disso não é anotado; o N2 o
+    /// descobre pela guarda e a desotimização deve zerar o contador (reanotar).
+    pub const UMA_SEM_NOVIDADE: u8 = 64;
+    pub const ESTAVEL: u8 = 192;
+    pub const TIPOS: u8 = 63;
+}
+
+/// Chamadas + voltas de laço/16 a partir das quais a função conta como quente (alvo do N2).
+/// Só anotado: ainda não há JIT.
+pub const LIMITE_QUENTE: u32 = 1000;
 
 /// Uma função de bytecode pronta para rodar neste motor.
 pub struct Proto {
     pub script: Rc<Script>,
     pub indice: u32,
     pub consts: Vec<ConstRt>,
+    /// shortcut: criados na carga, não depois de algumas execuções como pede a seção 6 (função
+    /// que nunca roda paga ~24 bytes por cache); criar na 1ª chamada se a memória pesar.
     pub caches: Vec<CacheProp>,
+    /// Feedback de tipos por cache ([`tipo`]); os caches de propriedade/chamada deixam 0.
+    pub tipos: Vec<u8>,
     pub nome: Valor,
-    /// Chamadas (calor, para o N2 no futuro).
+    /// Chamadas e voltas de laço (amostradas de 256 em 256 no `SaltaAtras`): o calor para o N2
+    /// ([`Proto::quente`]).
     pub chamadas: u32,
+    pub voltas: u32,
     /// Fonte do script (para `Function.prototype.toString`).
     pub fonte: Option<Rc<str>>,
     /// Nome da fonte na pilha dos erros (`macro`, `api`, a URL do script…).
@@ -88,6 +126,10 @@ pub struct Proto {
 }
 
 impl Proto {
+    pub fn quente(&self) -> bool {
+        self.chamadas.saturating_add(self.voltas / 16) >= LIMITE_QUENTE
+    }
+
     #[inline]
     pub fn codigo(&self) -> &falcao_bytecode::FuncaoBytecode {
         &self.script.funcoes[self.indice as usize]
@@ -95,6 +137,41 @@ impl Proto {
 }
 
 impl Motor {
+    /// O perfil de cada função que rodou (chamadas, voltas, tipos e formas vistos por cache),
+    /// para depurar e para o N2: `FALCAO_PERFIL=1` no exemplo `rodar`.
+    pub fn relatorio_perfil(&mut self) -> String {
+        let nomes_tipo = [(tipo::INT, "int"), (tipo::DOUBLE, "double"), (tipo::TEXTO, "texto"), (tipo::BIGINT, "bigint"), (tipo::OUTRO, "outro"), (tipo::ESTOUROU, "estourou")];
+        let mut s = String::new();
+        for i in 0..self.protos.len() {
+            let (chamadas, voltas, quente, nome) = {
+                let p = &self.protos[i];
+                (p.chamadas, p.voltas, p.quente(), p.nome)
+            };
+            if chamadas == 0 && voltas == 0 {
+                continue;
+            }
+            let nome = self.texto_rust(nome);
+            let nome = if nome.is_empty() { "<anônima>" } else { &nome };
+            s += &format!("{nome}: {chamadas} chamadas, {voltas} voltas{}\n", if quente { ", QUENTE" } else { "" });
+            let p = &self.protos[i];
+            for (c, (&t, cp)) in p.tipos.iter().zip(&p.caches).enumerate() {
+                let t = t & tipo::TIPOS;
+                if t != 0 {
+                    let vistos: Vec<&str> = nomes_tipo.iter().filter(|(b, _)| t & b != 0).map(|(_, n)| *n).collect();
+                    s += &format!("  c{c}: {}\n", vistos.join("|"));
+                } else if cp.forma != u32::MAX {
+                    let estado = match cp.poli {
+                        SEM_POLI => "monomórfico".to_owned(),
+                        MEGA => "megamórfico".to_owned(),
+                        k => format!("polimórfico ({} formas)", 1 + self.poli[k as usize].iter().filter(|e| e.forma != u32::MAX).count()),
+                    };
+                    s += &format!("  c{c}: propriedade {estado}\n");
+                }
+            }
+        }
+        s
+    }
+
     // ---------------------------------------------------------------- argumentos
 
     #[inline]
@@ -156,7 +233,8 @@ impl Motor {
                 None => Valor::VAZIA,
             };
             let caches = vec![CacheProp::default(); fb.caches as usize];
-            self.protos.push(Proto { script: script.clone(), indice: i, consts, caches, nome, chamadas: 0, fonte: None, origem: None, modulo: u32::MAX });
+            let tipos = vec![0; fb.caches as usize];
+            self.protos.push(Proto { script: script.clone(), indice: i, consts, caches, tipos, nome, chamadas: 0, voltas: 0, fonte: None, origem: None, modulo: u32::MAX });
         }
         base
     }
@@ -265,8 +343,12 @@ impl Motor {
         let fl = fb.flags;
         let comprimento = fb.comprimento;
         let nome = nome.unwrap_or(p.nome);
-        let forma = if fl.gerador {
+        let forma = if fl.gerador && fl.assincrona {
+            self.intr.forma_funcao_gerador_async
+        } else if fl.gerador {
             self.intr.forma_funcao_gerador
+        } else if fl.assincrona {
+            self.intr.forma_funcao_async
         } else if fl.sem_construtor {
             self.intr.forma_funcao_simples
         } else {
@@ -285,9 +367,13 @@ impl Motor {
             || (self.e_objeto(v) && self.formas.get(self.forma(v)).classe == Classe::Proxy && self.e_funcao(Valor(self.interno(v, 0))))
     }
 
-    pub fn e_construtor(&self, v: Valor) -> bool {
+    pub fn e_construtor(&self, mut v: Valor) -> bool {
         if !self.e_objeto(v) {
             return false;
+        }
+        // `bind` de `bind` de …: desce até a função de verdade num laço.
+        while self.formas.get(self.forma(v)).classe == Classe::FuncaoLigada {
+            v = Valor(self.interno(v, 0));
         }
         match self.formas.get(self.forma(v)).classe {
             Classe::Funcao => {
@@ -298,16 +384,18 @@ impl Motor {
                     !self.protos[c as usize].codigo().flags.sem_construtor
                 }
             }
-            Classe::FuncaoLigada => self.e_construtor(Valor(self.interno(v, 0))),
             _ => false,
         }
     }
 
     /// Cria o `prototype` preguiçoso de uma função na primeira leitura.
     pub fn materializar_prototype(&mut self, f: Valor) -> Valor {
-        let gerador = self.forma(f) == self.intr.forma_funcao_gerador;
-        let p = if gerador {
+        let ff = self.forma(f);
+        let p = if ff == self.intr.forma_funcao_gerador {
             let forma = self.intr.forma_objeto_gerador;
+            self.novo_objeto(forma)
+        } else if ff == self.intr.forma_funcao_gerador_async {
+            let forma = self.intr.forma_objeto_gerador_async;
             self.novo_objeto(forma)
         } else {
             let forma = self.intr.forma_objeto;
@@ -329,7 +417,6 @@ impl Motor {
             self.formas.get_mut(fp).e_prototipo = true;
             self.formas.get(fp).hash
         };
-        let el = if classe == Classe::Array { TipoElementos::Inteiros } else { TipoElementos::Inteiros };
-        self.formas.raiz(classe, proto, inline, el, hp)
+        self.formas.raiz(classe, proto, inline, TipoElementos::Inteiros, hp)
     }
 }

@@ -6,7 +6,7 @@ use crate::funcao::{Constante, Excecao};
 use crate::instrucoes::Op;
 use falcao_sintaxe::arvore::*;
 use falcao_sintaxe::atomos::Atomo;
-use falcao_sintaxe::{Ref, TipoEscopo};
+use falcao_sintaxe::{EscopoId, Ref, TipoEscopo, TipoVinculo};
 
 impl Compilador<'_> {
     pub(crate) fn lista_comandos(&mut self, l: Lista) -> R<()> {
@@ -43,7 +43,7 @@ impl Compilador<'_> {
             No::Vazio | No::Depurador => {}
             No::Expressao(e) => {
                 self.posicao(n);
-                self.expr(e)?;
+                self.expr_descartada(e)?;
             }
             No::Var { tipo, decls } => self.declaracao(tipo, decls)?,
             No::Se { teste, sim, nao } => {
@@ -83,7 +83,7 @@ impl Compilador<'_> {
                     c.op0(Op::RenovaContexto);
                 }
                 if passo.existe() {
-                    c.expr(passo)?;
+                    c.expr_descartada(passo)?;
                 }
                 c.salta(Op::SaltaAtras, volta);
                 c.por(fim);
@@ -105,18 +105,25 @@ impl Compilador<'_> {
             })?,
             No::ParaDe { esq, dir, corpo, aguarda } => self.com_escopo_do_no(n, |c| {
                 let it = c.temp();
+                // `for await`: o valor de `return` fica aqui enquanto o iterador fecha (aguardando).
+                let guarda = if aguarda { c.temp() } else { 0 };
                 c.expr(dir)?;
-                // shortcut: `for await` usa o mesmo Proximo; o runtime espera cada promessa.
                 c.op(Op::ObtemIterador, &[Arg::U(it), Arg::U(u32::from(aguarda))]);
                 let volta = c.rotulo();
                 let fim = c.rotulo();
                 let fecha = c.rotulo();
                 let ini = c.f.em.aqui();
-                c.f.saidas.push(Saida::Iterador(it));
+                c.f.saidas.push(if aguarda { Saida::IteradorAsync(it, guarda) } else { Saida::Iterador(it) });
                 c.por(volta);
-                c.op(Op::Proximo, &[Arg::U(it), Arg::Para(fim)]);
+                if aguarda {
+                    c.op(Op::ChamaProximo, &[Arg::U(it)]);
+                    c.op0(Op::Aguarda);
+                    c.op(Op::ResultadoProximo, &[Arg::U(it), Arg::Para(fim)]);
+                } else {
+                    c.op(Op::Proximo, &[Arg::U(it), Arg::Para(fim)]);
+                }
                 c.alvo_de_laco(n, esq)?;
-                c.corpo_de_laco(corpo, rotulos, fim, volta)?;
+                c.corpo_de_laco_de_iterador(corpo, rotulos, fim, volta)?;
                 c.salta(Op::SaltaAtras, volta);
                 c.f.saidas.pop();
                 // Exceção dentro do laço: fecha o iterador e relança.
@@ -125,8 +132,21 @@ impl Compilador<'_> {
                 c.por(fecha);
                 let exc = c.temp();
                 c.op(Op::Guarda, &[Arg::U(exc)]);
-                c.op(Op::FechaIterador, &[Arg::U(it)]);
-                c.op(Op::Relanca, &[Arg::U(exc)]);
+                if aguarda {
+                    // Erro do `return()` ou da espera dele é engolido: o original vence.
+                    let relanca = c.rotulo();
+                    let ini_fecha = c.f.em.aqui();
+                    c.op(Op::FechaIteradorAsync, &[Arg::U(it), Arg::Para(relanca)]);
+                    c.op0(Op::Aguarda);
+                    let fim_fecha = c.f.em.aqui();
+                    c.por(relanca);
+                    c.op(Op::Relanca, &[Arg::U(exc)]);
+                    let alvo = c.f.em.endereco(relanca);
+                    c.f.excecoes.push(Excecao { inicio: ini_fecha, fim: fim_fecha, alvo, contextos });
+                } else {
+                    c.op(Op::FechaIteradorEmErro, &[Arg::U(it)]);
+                    c.op(Op::Relanca, &[Arg::U(exc)]);
+                }
                 let alvo = c.f.em.endereco(fecha);
                 c.f.excecoes.push(Excecao { inicio: ini, fim: fim_faixa, alvo, contextos });
                 c.por(fim);
@@ -161,12 +181,16 @@ impl Compilador<'_> {
                     None => !continua || a.continua.is_some(),
                 });
                 let Some(a) = alvo else { return self.erro(n, "break/continue sem alvo") };
-                let (nivel, destino) = (a.nivel, if continua { a.continua.unwrap() } else { a.quebra });
+                let (nivel, destino) = if continua { (a.nivel, a.continua.unwrap()) } else { (a.nivel_quebra, a.quebra) };
                 self.sair_para(nivel, Destino::Para(destino));
             }
             No::Retorne(arg) => {
                 if arg.existe() {
                     self.expr(arg)?;
+                    // Em gerador async, `return x` aguarda x.
+                    if self.f.flags.gerador && self.f.flags.assincrona {
+                        self.op0(Op::Aguarda);
+                    }
                 } else {
                     self.op0(Op::CarregaUndef);
                 }
@@ -200,7 +224,7 @@ impl Compilador<'_> {
                 } else {
                     let fim = self.rotulo();
                     let nivel = self.f.saidas.len();
-                    self.f.alvos.push(Alvo { rotulos: rs, quebra: fim, continua: None, nivel });
+                    self.f.alvos.push(Alvo { rotulos: rs, quebra: fim, continua: None, nivel, nivel_quebra: nivel });
                     let r = self.comando(corpo);
                     self.f.alvos.pop();
                     r?;
@@ -307,7 +331,17 @@ impl Compilador<'_> {
 
     fn corpo_de_laco(&mut self, corpo: NoId, rotulos: Vec<Atomo>, quebra: Rotulo, continua: Rotulo) -> R<()> {
         let nivel = self.f.saidas.len();
-        self.f.alvos.push(Alvo { rotulos, quebra, continua: Some(continua), nivel });
+        self.corpo_com_alvo(corpo, Alvo { rotulos, quebra, continua: Some(continua), nivel, nivel_quebra: nivel })
+    }
+
+    /// Corpo de for-of: o iterador é a última saída e o `break` fecha ele (o `continue` não).
+    fn corpo_de_laco_de_iterador(&mut self, corpo: NoId, rotulos: Vec<Atomo>, quebra: Rotulo, continua: Rotulo) -> R<()> {
+        let nivel = self.f.saidas.len();
+        self.corpo_com_alvo(corpo, Alvo { rotulos, quebra, continua: Some(continua), nivel, nivel_quebra: nivel - 1 })
+    }
+
+    fn corpo_com_alvo(&mut self, corpo: NoId, alvo: Alvo) -> R<()> {
+        self.f.alvos.push(alvo);
         let r = self.comando(corpo);
         self.f.alvos.pop();
         r
@@ -335,7 +369,7 @@ impl Compilador<'_> {
         }
         self.salta(Op::Salta, padrao.unwrap_or(fim));
         let nivel = self.f.saidas.len();
-        self.f.alvos.push(Alvo { rotulos, quebra: fim, continua: None, nivel });
+        self.f.alvos.push(Alvo { rotulos, quebra: fim, continua: None, nivel, nivel_quebra: nivel });
         for (i, &c) in casos.iter().enumerate() {
             let No::Caso { corpo, .. } = *self.arv.no(c) else { continue };
             self.por(rotulos_casos[i]);
@@ -432,6 +466,16 @@ impl Compilador<'_> {
         let base = self.f.topo;
         let escopo = self.esc.escopo_da_classe[c.0 as usize];
         let regs = self.entrar_escopo(escopo);
+        // Nomes privados: um símbolo novo a cada avaliação da classe (duas classes, ou a mesma
+        // avaliada duas vezes, não leem os `#x` uma da outra).
+        for v in self.esc.escopo(escopo).vinculos.clone() {
+            let vin = *self.esc.vinculo(v);
+            if vin.tipo == TipoVinculo::Privado {
+                let k = self.k_texto(format!("#{}", self.lex.atomos.texto(vin.nome)).encode_utf16().collect());
+                self.op(Op::NovoPrivado, &[Arg::U(k)]);
+                self.gravar_local(v, true);
+            }
+        }
         let rh = self.temp();
         if classe.heranca.existe() {
             self.expr(classe.heranca)?;
@@ -452,58 +496,97 @@ impl Compilador<'_> {
         self.op(Op::CriaClasse, &[Arg::U(k), Arg::U(rh)]);
         let rf = self.temp();
         self.op(Op::Guarda, &[Arg::U(rf)]);
-        // O nome da classe dentro dela.
-        if classe.nome.is_some() {
-            if let Some(&v) = self.esc.escopo(escopo).vinculos.first() {
-                self.gravar_local(v, true);
-                self.iniciado(v);
-            }
-        }
         let rp = self.temp();
         let kp = self.k_nome_texto("prototype".encode_utf16().collect());
         self.op(Op::LeProp, &[Arg::U(rf), Arg::U(kp), Arg::Cache]);
         self.op(Op::Guarda, &[Arg::U(rp)]);
+        // Na ordem da norma (ClassDefinitionEvaluation): primeiro cada elemento (chaves
+        // calculadas na ordem, métodos públicos definidos, os de instância registrados), depois o
+        // nome da classe, os métodos privados estáticos, e por fim campos e blocos estáticos.
+        let mut estaticos = Vec::new();
+        let mut privados_estaticos = Vec::new();
         for m in &classe.membros {
             let marca = self.f.topo;
             let alvo = if m.estatico { rf } else { rp };
-            match m.tipo {
-                TipoMembroClasse::Metodo | TipoMembroClasse::Get | TipoMembroClasse::Set => {
+            match (m.tipo, m.chave) {
+                (TipoMembroClasse::Metodo | TipoMembroClasse::Get | TipoMembroClasse::Set, Chave::Privada(a)) => {
+                    if m.estatico {
+                        privados_estaticos.push(*m);
+                        continue;
+                    }
+                    let rk = self.chave_privada_declarada(escopo, a);
+                    self.metodo_privado(m, a, rp)?;
+                    self.op(Op::DefCampo, &[Arg::U(rf), Arg::U(rk), Arg::U(tipo_privado(m.tipo))]);
+                }
+                (TipoMembroClasse::Metodo | TipoMembroClasse::Get | TipoMembroClasse::Set, _) => {
                     let rk = self.chave_reg(m.chave)?;
                     self.metodo_valor(m.valor, alvo)?;
+                    self.op(Op::NomeiaFuncao, &[Arg::U(rk), Arg::U(tipo_privado(m.tipo) - 1)]);
                     match m.tipo {
                         TipoMembroClasse::Metodo => self.op(Op::DefMetodo, &[Arg::U(alvo), Arg::U(rk)]),
                         TipoMembroClasse::Get => self.op(Op::DefAcessor, &[Arg::U(alvo), Arg::U(rk), Arg::U(2)]),
                         _ => self.op(Op::DefAcessor, &[Arg::U(alvo), Arg::U(rk), Arg::U(3)]),
                     }
                 }
-                TipoMembroClasse::Campo | TipoMembroClasse::Acessor => {
+                (TipoMembroClasse::Campo | TipoMembroClasse::Acessor, _) => {
                     let rk = self.chave_reg(m.chave)?;
+                    if m.estatico {
+                        // A chave já está avaliada; o inicializador roda depois de todos os
+                        // elementos. O registrador da chave fica preso até lá.
+                        estaticos.push((*m, rk));
+                        continue;
+                    }
                     if m.valor.existe() {
                         self.metodo_valor(m.valor, alvo)?;
                     } else {
                         self.op0(Op::CarregaUndef);
                     }
-                    if m.estatico {
-                        // Campo estático: roda o inicializador agora, com this = classe.
-                        let bloco = self.temps(2);
-                        self.op(Op::Guarda, &[Arg::U(bloco)]);
-                        self.op(Op::Move, &[Arg::U(bloco + 1), Arg::U(rf)]);
-                        let pronto = self.rotulo();
-                        self.op(Op::Carrega, &[Arg::U(bloco)]);
-                        self.salta(Op::SaltaSeIndef, pronto);
-                        self.op(Op::Chama, &[Arg::U(bloco), Arg::U(bloco + 1), Arg::U(0), Arg::Cache]);
-                        self.por(pronto);
-                        self.op(Op::DefItem, &[Arg::U(rf), Arg::U(rk)]);
-                    } else {
-                        self.op(Op::DefCampo, &[Arg::U(rf), Arg::U(rk)]);
-                    }
+                    let t = if self.campo_anonimo(m.valor) { 4 } else { 0 };
+                    self.op(Op::DefCampo, &[Arg::U(rf), Arg::U(rk), Arg::U(t)]);
                 }
-                TipoMembroClasse::BlocoEstatico => {
-                    let bloco = self.temps(2);
-                    self.metodo_valor(m.valor, rf)?;
-                    self.op(Op::Guarda, &[Arg::U(bloco)]);
-                    self.op(Op::Move, &[Arg::U(bloco + 1), Arg::U(rf)]);
-                    self.op(Op::Chama, &[Arg::U(bloco), Arg::U(bloco + 1), Arg::U(0), Arg::Cache]);
+                (TipoMembroClasse::BlocoEstatico, _) => {
+                    estaticos.push((*m, u32::MAX));
+                    continue;
+                }
+            }
+            self.liberar(marca);
+        }
+        // O nome da classe dentro dela.
+        if classe.nome.is_some() {
+            if let Some(&v) = self.esc.escopo(escopo).vinculos.first() {
+                self.op(Op::Carrega, &[Arg::U(rf)]);
+                self.gravar_local(v, true);
+                self.iniciado(v);
+            }
+        }
+        for m in privados_estaticos {
+            let marca = self.f.topo;
+            let Chave::Privada(a) = m.chave else { unreachable!() };
+            let rk = self.chave_privada_declarada(escopo, a);
+            self.metodo_privado(&m, a, rf)?;
+            self.op(Op::DefinePrivado, &[Arg::U(rf), Arg::U(rk), Arg::U(tipo_privado(m.tipo))]);
+            self.liberar(marca);
+        }
+        for (m, rk) in estaticos {
+            let marca = self.f.topo;
+            // Bloco estático, ou campo estático com inicializador: roda com this = classe.
+            if m.valor.existe() {
+                let bloco = self.temps(2);
+                self.metodo_valor(m.valor, rf)?;
+                self.op(Op::Guarda, &[Arg::U(bloco)]);
+                self.op(Op::Move, &[Arg::U(bloco + 1), Arg::U(rf)]);
+                self.op(Op::Chama, &[Arg::U(bloco), Arg::U(bloco + 1), Arg::U(0), Arg::Cache]);
+                if self.campo_anonimo(m.valor) {
+                    self.op(Op::NomeiaFuncao, &[Arg::U(rk), Arg::U(0)]);
+                }
+            } else {
+                self.op0(Op::CarregaUndef);
+            }
+            if m.tipo != TipoMembroClasse::BlocoEstatico {
+                if matches!(m.chave, Chave::Privada(_)) {
+                    self.op(Op::DefinePrivado, &[Arg::U(rf), Arg::U(rk), Arg::U(0)]);
+                } else {
+                    self.op(Op::DefItem, &[Arg::U(rf), Arg::U(rk)]);
                 }
             }
             self.liberar(marca);
@@ -512,5 +595,55 @@ impl Compilador<'_> {
         self.sair_escopo(escopo, regs);
         self.liberar(base);
         Ok(())
+    }
+
+    /// O inicializador do campo é só uma função anônima (`x = function(){}`, `x = () => 1`)?
+    /// Ela recebe o nome da chave (NamedEvaluation).
+    fn campo_anonimo(&self, valor: NoId) -> bool {
+        if !valor.existe() {
+            return false;
+        }
+        let No::Funcao(f) = *self.arv.no(valor) else { return false };
+        let &[ret] = self.arv.lista(self.arv.funcao(f).corpo) else { return false };
+        let No::Retorne(mut e) = *self.arv.no(ret) else { return false };
+        if !e.existe() {
+            return false;
+        }
+        while let No::Paren(x) = *self.arv.no(e) {
+            e = x;
+        }
+        matches!(*self.arv.no(e), No::Funcao(g) if self.arv.funcao(g).nome.is_none())
+    }
+
+    /// Registrador com o nome privado `#a` declarado na classe de `escopo`.
+    fn chave_privada_declarada(&mut self, escopo: EscopoId, a: Atomo) -> u32 {
+        let r = self.temp();
+        let v = self.esc.privados[&(escopo.0, a)];
+        self.ler_vinculo(v, a);
+        self.op(Op::Guarda, &[Arg::U(r)]);
+        r
+    }
+
+    /// acc = o método/getter/setter privado `m`, com o nome `#a` (`get #a`, `set #a`).
+    fn metodo_privado(&mut self, m: &MembroClasse, a: Atomo, casa: u32) -> R<()> {
+        let prefixo = match m.tipo {
+            TipoMembroClasse::Get => "get ",
+            TipoMembroClasse::Set => "set ",
+            _ => "",
+        };
+        let nome = self.texto_u16(format!("{prefixo}#{}", self.lex.atomos.texto(a)).encode_utf16().collect());
+        let No::Funcao(f) = *self.arv.no(m.valor) else { unreachable!() };
+        self.criar_funcao(f, Some(nome));
+        self.op(Op::DefineCasa, &[Arg::U(casa)]);
+        Ok(())
+    }
+}
+
+/// N de `DefCampo`/`DefinePrivado` para método (1), getter (2) e setter (3) privados.
+fn tipo_privado(t: TipoMembroClasse) -> u32 {
+    match t {
+        TipoMembroClasse::Get => 2,
+        TipoMembroClasse::Set => 3,
+        _ => 1,
     }
 }

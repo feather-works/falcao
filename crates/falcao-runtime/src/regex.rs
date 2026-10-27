@@ -9,8 +9,9 @@
 //! - quantificador sobre grupo usa recursão: passado o limite de profundidade
 //!   o casamento devolve None;
 //! - lookbehind tenta todos os inícios para trás (quadrático);
-//! - a flag `v` é tratada como `u` (sem conjuntos de classe aninhados);
-//! - classes Unicode (`\p{..}`) são aproximações com métodos de `char`.
+//! - modo `v`: conjuntos (`--`, `&&`, aninhados, `\q{..}`) sim; propriedades de
+//!   strings (`\p{RGI_Emoji}` etc.) não (sem dados de emoji-sequences);
+//! - tabelas Unicode (`\p{..}`) são as oficiais de `unicode_tabelas.rs`, geradas do UCD.
 
 /// Flags de uma expressão regular, lidas com `Flags::de_texto`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -23,6 +24,19 @@ pub struct Flags {
     pub aderente: bool,
     pub indices: bool,
     pub v: bool,
+}
+
+/// Erro antecipado: cada literal `/…/f` do script tem de compilar (antes de rodar qualquer código).
+pub fn validar_literais(script: &falcao_bytecode::Script) -> Result<(), String> {
+    for fb in &script.funcoes {
+        for c in &fb.constantes {
+            if let falcao_bytecode::Constante::Regex { corpo, flags } = c {
+                let f = Flags::de_texto(&script.textos[*flags as usize])?;
+                Programa::compilar(&script.textos[*corpo as usize], &f)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Flags {
@@ -56,6 +70,9 @@ impl Flags {
 
 /// Passos de casamento permitidos antes de desistir (devolve None).
 const LIMITE_PASSOS: u64 = 50_000_000;
+/// Passos somados de todos os inícios de uma busca (~2 s): por início, `/(?<=a+)b/` em 200 mil
+/// `a` gastaria até LIMITE_PASSOS em cada um.
+const LIMITE_BUSCA: u64 = 1_000_000_000;
 /// shortcut: 1500 níveis de recursão para grupos repetidos; sobe se a pilha permitir.
 const LIMITE_PROFUNDIDADE: usize = 1500;
 
@@ -92,6 +109,8 @@ struct Quant {
 struct Classe {
     itens: Vec<Item>,
     negada: bool,
+    /// Resposta pronta para os caracteres < 256 (já com `i` e a negação), feita em `preparar`.
+    mapa: [u64; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -106,26 +125,8 @@ enum Pred {
     Dig,
     Pal,
     Esp,
-    Prop(Prop),
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Prop {
-    Qualquer,
-    Ascii,
-    Letra,
-    Maiuscula,
-    Minuscula,
-    Numero,
-    Digito,
-    Pontuacao,
-    Simbolo,
-    Espaco,
-    Alfabetico,
-    Latim,
-    Grego,
-    Cirilico,
-    Han,
+    /// `\p{..}`: faixas ordenadas (tabelas de `unicode_tabelas`).
+    Tab(&'static [(u32, u32)]),
 }
 
 /// Estado de uma tentativa de casamento.
@@ -152,6 +153,8 @@ pub struct Programa {
     nomes: Vec<(Vec<u16>, usize)>,
     opc: Flags,
     prefixo: Option<u16>,
+    /// Unidades que podem abrir um casamento (só < 256): `procurar` pula as outras.
+    primeiros: Option<[u64; 4]>,
 }
 
 impl Programa {
@@ -167,6 +170,8 @@ impl Programa {
             total,
             contador: 0,
             nomes: nomes_pre,
+            prof: 0,
+            vset: flags.v,
         };
         let raiz = an.disjuncao()?;
         if an.i < an.p.len() {
@@ -183,10 +188,17 @@ impl Programa {
         }
         let mut opc = flags.clone();
         opc.unicode = unicode;
+        let mut raiz = raiz;
+        preparar(&mut raiz, &opc);
         let prefixo = if flags.ignorar_caixa {
             None
         } else {
             prefixo_literal(&raiz)
+        };
+        let mut primeiros = [0u64; 4];
+        let primeiros = match primeiros_de(&raiz, &opc, &mut primeiros) {
+            Some(false) => Some(primeiros),
+            _ => None,
         };
         Ok(Programa {
             raiz,
@@ -194,6 +206,7 @@ impl Programa {
             nomes,
             opc,
             prefixo,
+            primeiros,
         })
     }
 
@@ -209,7 +222,8 @@ impl Programa {
 
     /// Tenta casar começando EXATAMENTE em `inicio` (não procura adiante).
     pub fn casar_em(&self, texto: &[u16], inicio: usize) -> Option<Vec<Option<(usize, usize)>>> {
-        self.casar_interno(texto, inicio).0
+        let mut caps = vec![None; self.grupos + 1];
+        self.casar_interno(texto, inicio, &mut 0, &mut caps).0.then_some(caps)
     }
 
     /// Procura o primeiro casamento a partir de `inicio` (se aderente, só em `inicio`).
@@ -217,18 +231,35 @@ impl Programa {
         if self.opc.aderente {
             return self.casar_em(texto, inicio);
         }
+        self.procurar_adiante(texto, inicio)
+    }
+
+    /// Como `procurar`, ignorando a flag `y`: o primeiro casamento em `inicio` ou depois. Para o
+    /// `split`, que tenta casar (aderente) em cada posição: dá o mesmo que essas tentativas uma a uma.
+    pub fn procurar_adiante(&self, texto: &[u16], inicio: usize) -> Option<Vec<Option<(usize, usize)>>> {
+        let mut passos = 0;
         let mut i = inicio;
-        while i <= texto.len() {
+        // Um vetor de capturas para a busca toda: cada tentativa só o limpa.
+        let mut caps = vec![None; self.grupos + 1];
+        while i <= texto.len() && passos <= LIMITE_BUSCA {
             if let Some(lit) = self.prefixo {
                 // Pula direto para onde o primeiro caractere literal aparece.
                 match texto.get(i..).and_then(|r| r.iter().position(|&u| u == lit)) {
                     Some(d) => i += d,
                     None => return None,
                 }
+            } else if let Some(ok) = &self.primeiros {
+                match texto.get(i..).and_then(|r| r.iter().position(|&u| u < 256 && ok[u as usize >> 6] >> (u & 63) & 1 != 0)) {
+                    Some(d) => i += d,
+                    None => return None,
+                }
             }
-            let (r, abortou) = self.casar_interno(texto, i);
-            if r.is_some() || abortou {
-                return r;
+            let (achou, abortou) = self.casar_interno(texto, i, &mut passos, &mut caps);
+            if achou {
+                return Some(caps);
+            }
+            if abortou {
+                return None;
             }
             i += match self.ler(texto, i) {
                 Some((_, w)) => w,
@@ -238,12 +269,15 @@ impl Programa {
         None
     }
 
-    fn casar_interno(&self, t: &[u16], inicio: usize) -> (Option<Vec<Option<(usize, usize)>>>, bool) {
+    /// `passos`: o que a busca já gastou (soma o desta tentativa).
+    /// Devolve (casou, abortou); ao casar, as capturas ficam em `caps`.
+    fn casar_interno(&self, t: &[u16], inicio: usize, passos: &mut u64, caps: &mut Vec<Option<(usize, usize)>>) -> (bool, bool) {
         if inicio > t.len() {
-            return (None, false);
+            return (false, false);
         }
+        caps.fill(None);
         let mut e = Estado {
-            caps: vec![None; self.grupos + 1],
+            caps: std::mem::take(caps),
             passos: 0,
             prof: 0,
             abortou: false,
@@ -252,11 +286,9 @@ impl Programa {
             e2.caps[0] = Some((inicio, p));
             true
         });
-        if ok {
-            (Some(e.caps), false)
-        } else {
-            (None, e.abortou)
-        }
+        *passos += e.passos;
+        *caps = e.caps;
+        (ok, !ok && e.abortou)
     }
 
     /// Casa `no` em `pos`; ao casar, chama a continuação `k`.
@@ -423,7 +455,36 @@ impl Programa {
         e: &mut Estado,
         k: &mut dyn FnMut(usize, &mut Estado) -> bool,
     ) -> bool {
-        if q.guloso {
+        if q.guloso && !self.opc.unicode {
+            // Fora do modo u cada volta consome uma unidade: o fim da volta n é pos + n.
+            let mx = q.max.unwrap_or(usize::MAX);
+            let mut p = pos;
+            while p - pos < mx {
+                if !conta(e) {
+                    return false;
+                }
+                match self.atomo_casa(inner, t, p) {
+                    Some(np) => p = np,
+                    None => break,
+                }
+            }
+            let cont = p - pos;
+            if cont < q.min {
+                return false;
+            }
+            for n in (q.min..=cont).rev() {
+                if !conta(e) {
+                    return false;
+                }
+                if k(pos + n, e) {
+                    return true;
+                }
+                if e.abortou {
+                    return false;
+                }
+            }
+            false
+        } else if q.guloso {
             let mut fins = vec![pos];
             let mut p = pos;
             loop {
@@ -604,6 +665,13 @@ impl Programa {
     }
 
     fn classe_casa(&self, cl: &Classe, c: u32) -> bool {
+        if c < 256 {
+            return cl.mapa[c as usize >> 6] >> (c & 63) & 1 != 0;
+        }
+        self.classe_casa_lento(cl, c)
+    }
+
+    fn classe_casa_lento(&self, cl: &Classe, c: u32) -> bool {
         let achou = if self.opc.ignorar_caixa {
             [c, baixa(c), alta(c)].iter().any(|&x| cl.itens_casa(x))
         } else {
@@ -639,6 +707,10 @@ struct Analisador {
     /// Grupos já abertos no texto (define o índice do próximo).
     contador: usize,
     nomes: Vec<(Vec<u32>, usize)>,
+    /// Grupos abertos agora: `((((…` fundo estouraria a pilha do Rust na leitura.
+    prof: usize,
+    /// Modo `v`: classes com conjuntos (`--`, `&&`, aninhadas, `\q{..}`).
+    vset: bool,
 }
 
 /// Item de classe ainda sem faixa montada.
@@ -823,6 +895,10 @@ impl Analisador {
             '.' => Ok((No::Qualquer, true)),
             '(' => self.grupo(),
             '[' => {
+                if self.vset {
+                    let c = self.classe_v()?;
+                    return Ok((conj_no(c), true));
+                }
                 let cl = self.classe()?;
                 Ok((No::Classe(cl), true))
             }
@@ -847,6 +923,16 @@ impl Analisador {
 
     /// Grupo; o `(` já foi consumido.
     fn grupo(&mut self) -> Result<(No, bool), String> {
+        if self.prof >= LIMITE_PROFUNDIDADE {
+            return Err("grupos aninhados demais".to_string());
+        }
+        self.prof += 1;
+        let r = self.grupo_nivel();
+        self.prof -= 1;
+        r
+    }
+
+    fn grupo_nivel(&mut self) -> Result<(No, bool), String> {
         if !self.e_char('?') {
             self.contador += 1;
             let idx = self.contador;
@@ -891,23 +977,17 @@ impl Analisador {
 
     /// Lê `nome>` (o `<` já foi consumido) e valida o nome.
     fn ler_nome(&mut self) -> Result<Vec<u32>, String> {
-        let mut nome = Vec::new();
+        let mut raw = Vec::new();
         loop {
             match self.avanca() {
                 None => return Err("nome de grupo sem '>'".to_string()),
                 Some(c) if c == '>' as u32 => break,
-                Some(c) => nome.push(c),
+                Some(c) => raw.push(c),
             }
         }
-        let valido = !nome.is_empty()
-            && nome.iter().enumerate().all(|(k, &c)| {
-                let ch = char::from_u32(c).unwrap_or('\0');
-                ch == '_' || ch == '$' || ch.is_alphabetic() || (k > 0 && ch.is_numeric())
-            });
-        if valido {
-            Ok(nome)
-        } else {
-            Err("nome de grupo inválido".to_string())
+        match decodifica_nome(&raw) {
+            Some(n) if !n.is_empty() && n.iter().enumerate().all(|(k, &c)| id_nome(c, k == 0)) => Ok(n),
+            _ => Err("nome de grupo inválido".to_string()),
         }
     }
 
@@ -926,6 +1006,7 @@ impl Analisador {
                     No::Classe(Classe {
                         itens: vec![Item::Pred(p, neg)],
                         negada: false,
+                        mapa: [0; 4],
                     }),
                     true,
                 ))
@@ -935,8 +1016,9 @@ impl Analisador {
                 let neg = ch == 'P';
                 Ok((
                     No::Classe(Classe {
-                        itens: vec![Item::Pred(Pred::Prop(pr), neg)],
+                        itens: vec![Item::Pred(Pred::Tab(pr), neg)],
                         negada: false,
+                        mapa: [0; 4],
                     }),
                     true,
                 ))
@@ -1112,7 +1194,7 @@ impl Analisador {
     }
 
     /// `{Nome}` depois de \p ou \P (modo u).
-    fn ler_propriedade(&mut self) -> Result<Prop, String> {
+    fn ler_propriedade(&mut self) -> Result<&'static [(u32, u32)], String> {
         if !self.e_char('{') {
             return Err("\\p exige {nome}".to_string());
         }
@@ -1173,7 +1255,159 @@ impl Analisador {
                 push_ac(&mut itens, a);
             }
         }
-        Ok(Classe { itens, negada })
+        Ok(Classe { itens, negada, mapa: [0; 4] })
+    }
+
+    /// Classe do modo `v` (o `[` já foi consumido): união, `--` ou `&&`, aninhadas, `\q{..}`.
+    fn classe_v(&mut self) -> Result<Conj, String> {
+        self.prof += 1;
+        if self.prof > LIMITE_PROFUNDIDADE {
+            return Err("classes aninhadas demais".to_string());
+        }
+        let negada = self.e_char('^');
+        if negada {
+            self.i += 1;
+        }
+        let mut acc = Conj::default();
+        if !self.e_char(']') {
+            let primeiro = self.operando_v()?;
+            let op = if self.duplo('-') {
+                Some('-')
+            } else if self.duplo('&') {
+                Some('&')
+            } else {
+                None
+            };
+            match op {
+                Some(o) => {
+                    acc = normaliza_conj(primeiro.0);
+                    loop {
+                        if self.e_char(']') {
+                            self.i += 1;
+                            break;
+                        }
+                        if !self.duplo(o) || (o == '&' && self.olha_em(2) == Some('&' as u32)) {
+                            return Err("operador de classe inválido ou misturado".to_string());
+                        }
+                        self.i += 2;
+                        let (c2, _) = self.operando_v()?;
+                        let c2 = normaliza_conj(c2);
+                        acc = if o == '-' { subtrai_conj(acc, c2) } else { intersecao_conj(acc, c2) };
+                    }
+                }
+                None => {
+                    let mut pend = Some(primeiro);
+                    loop {
+                        let (c, ch) = match pend.take() {
+                            Some(x) => x,
+                            None => {
+                                if self.e_char(']') {
+                                    self.i += 1;
+                                    break;
+                                }
+                                if self.duplo('-') || self.duplo('&') {
+                                    return Err("operador de classe inválido ou misturado".to_string());
+                                }
+                                self.operando_v()?
+                            }
+                        };
+                        match ch {
+                            Some(x) if self.e_char('-') => {
+                                if self.olha_em(1) == Some('-' as u32) {
+                                    return Err("operador '--' misturado com união".to_string());
+                                }
+                                self.i += 1;
+                                let y = self
+                                    .operando_v()?
+                                    .1
+                                    .ok_or_else(|| "intervalo inválido na classe".to_string())?;
+                                if x > y {
+                                    return Err("intervalo fora de ordem".to_string());
+                                }
+                                acc.faixas.push((x, y));
+                            }
+                            _ => {
+                                acc.faixas.extend(c.faixas);
+                                acc.cadeias.extend(c.cadeias);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        acc.faixas = normaliza(acc.faixas);
+        if negada {
+            if !acc.cadeias.is_empty() {
+                return Err("classe negada não pode ter cadeias \\q".to_string());
+            }
+            acc.faixas = complemento(&acc.faixas);
+        }
+        self.prof -= 1;
+        Ok(acc)
+    }
+
+    /// `--`/`&&` na posição atual?
+    fn duplo(&self, c: char) -> bool {
+        self.e_char(c) && self.olha_em(1) == Some(c as u32)
+    }
+
+    /// Operando do modo `v`: classe aninhada, `\q{..}`, classe de escape ou caractere.
+    /// Devolve o conjunto e, se for um caractere solto, esse caractere (para `a-z`).
+    fn operando_v(&mut self) -> Result<(Conj, Option<u32>), String> {
+        let c = self.olha().ok_or_else(|| "classe não fechada".to_string())?;
+        if c == '[' as u32 {
+            self.i += 1;
+            return Ok((self.classe_v()?, None));
+        }
+        if c == '\\' as u32 && self.olha_em(1) == Some('q' as u32) {
+            self.i += 2;
+            return Ok((self.q_v()?, None));
+        }
+        if c != '\\' as u32 {
+            let ch = char::from_u32(c).unwrap_or('\0');
+            if "()[]{}/-|".contains(ch) {
+                return Err(format!("'{}' precisa de escape na classe", ch));
+            }
+            if "&!#$%*+,.:;<=>?@^`~".contains(ch) && self.olha_em(1) == Some(c) {
+                return Err("pontuador duplo reservado na classe".to_string());
+            }
+        }
+        Ok(match self.item_classe()? {
+            Ac::C(x) => (Conj { faixas: vec![(x, x)], cadeias: Vec::new() }, Some(x)),
+            Ac::P(p, n) => (Conj { faixas: pred_faixas(p, n), cadeias: Vec::new() }, None),
+        })
+    }
+
+    /// `{a|bc|}` depois de `\q`: um caractere vira faixa, o resto vira cadeia.
+    fn q_v(&mut self) -> Result<Conj, String> {
+        if !self.e_char('{') {
+            return Err("\\q exige {".to_string());
+        }
+        self.i += 1;
+        let mut conj = Conj::default();
+        let mut cad: Vec<u32> = Vec::new();
+        loop {
+            let c = self.olha().ok_or_else(|| "\\q sem '}'".to_string())?;
+            if c == '}' as u32 || c == '|' as u32 {
+                self.i += 1;
+                if cad.len() == 1 {
+                    conj.faixas.push((cad[0], cad[0]));
+                } else {
+                    conj.cadeias.push(std::mem::take(&mut cad));
+                }
+                if c == '}' as u32 {
+                    break;
+                }
+                cad.clear();
+                continue;
+            }
+            match self.item_classe()? {
+                Ac::C(x) => cad.push(x),
+                Ac::P(..) => return Err("\\q não aceita classe de escape".to_string()),
+            }
+        }
+        conj.faixas = normaliza(conj.faixas);
+        Ok(conj)
     }
 
     /// Um item dentro de classe (caractere ou escape).
@@ -1196,7 +1430,7 @@ impl Analisador {
             }
             'p' | 'P' if self.unicode => {
                 let pr = self.ler_propriedade()?;
-                Ok(Ac::P(Pred::Prop(pr), ch == 'P'))
+                Ok(Ac::P(Pred::Tab(pr), ch == 'P'))
             }
             '0'..='9' => {
                 if ch == '0' && !self.olha().map_or(false, |x| (0x30..=0x39).contains(&x)) {
@@ -1213,6 +1447,120 @@ impl Analisador {
     }
 }
 
+/// Conjunto do modo `v`: faixas normalizadas e cadeias de `\q{..}` de tamanho != 1.
+#[derive(Default)]
+struct Conj {
+    faixas: Vec<(u32, u32)>,
+    cadeias: Vec<Vec<u32>>,
+}
+
+/// Ordena e funde faixas que se tocam ou se sobrepõem.
+fn normaliza(mut v: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    v.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(v.len());
+    for (a, b) in v {
+        match out.last_mut() {
+            Some(l) if a <= l.1.saturating_add(1) => l.1 = l.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
+fn normaliza_conj(c: Conj) -> Conj {
+    Conj { faixas: normaliza(c.faixas), cadeias: c.cadeias }
+}
+
+/// Complemento em 0..=0x10FFFF de faixas normalizadas.
+fn complemento(v: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut prox = 0u32;
+    for &(a, b) in v {
+        if a > prox {
+            out.push((prox, a - 1));
+        }
+        prox = b + 1;
+    }
+    if prox <= 0x10FFFF {
+        out.push((prox, 0x10FFFF));
+    }
+    out
+}
+
+/// Interseção de duas listas de faixas normalizadas.
+fn intersecao(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::new();
+    while i < a.len() && j < b.len() {
+        let lo = a[i].0.max(b[j].0);
+        let hi = a[i].1.min(b[j].1);
+        if lo <= hi {
+            out.push((lo, hi));
+        }
+        if a[i].1 < b[j].1 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
+}
+
+fn intersecao_conj(a: Conj, b: Conj) -> Conj {
+    let faixas = intersecao(&a.faixas, &b.faixas);
+    let cadeias = a.cadeias.into_iter().filter(|s| b.cadeias.contains(s)).collect();
+    Conj { faixas, cadeias }
+}
+
+fn subtrai_conj(a: Conj, b: Conj) -> Conj {
+    let faixas = intersecao(&a.faixas, &complemento(&b.faixas));
+    let cadeias = a.cadeias.into_iter().filter(|s| !b.cadeias.contains(s)).collect();
+    Conj { faixas, cadeias }
+}
+
+/// Faixas de um predicado (\d \w \s \p{..}), já complementadas se `neg`.
+fn pred_faixas(p: Pred, neg: bool) -> Vec<(u32, u32)> {
+    let v = match p {
+        Pred::Dig => vec![(0x30, 0x39)],
+        Pred::Pal => vec![(0x30, 0x39), (0x41, 0x5A), (0x5F, 0x5F), (0x61, 0x7A)],
+        Pred::Esp => vec![
+            (9, 13), (0x20, 0x20), (0xA0, 0xA0), (0x1680, 0x1680), (0x2000, 0x200A),
+            (0x2028, 0x2029), (0x202F, 0x202F), (0x205F, 0x205F), (0x3000, 0x3000), (0xFEFF, 0xFEFF),
+        ],
+        Pred::Tab(t) => t.to_vec(),
+    };
+    let v = normaliza(v);
+    if neg { complemento(&v) } else { v }
+}
+
+/// Conjunto do modo `v` -> nó: alternativas das cadeias (a mais longa primeiro), depois a classe.
+fn conj_no(c: Conj) -> No {
+    let cl = No::Classe(Classe {
+        itens: c.faixas.iter().map(|&(a, b)| Item::Faixa(a, b)).collect(),
+        negada: false,
+        mapa: [0; 4],
+    });
+    if c.cadeias.is_empty() {
+        return cl;
+    }
+    let mut cads = c.cadeias;
+    cads.sort_by(|a, b| b.len().cmp(&a.len()));
+    let mut alts: Vec<No> = Vec::new();
+    let mut vazia = false;
+    for s in cads {
+        if s.is_empty() {
+            vazia = true;
+        } else {
+            alts.push(No::Seq(s.into_iter().map(No::Char).collect()));
+        }
+    }
+    alts.push(cl);
+    if vazia {
+        alts.push(No::Seq(Vec::new()));
+    }
+    No::Alt(alts)
+}
+
 /// `\d \D \w \W \s \S` -> (predicado, negado).
 fn pred_de_letra(ch: char) -> (Pred, bool) {
     match ch {
@@ -1226,114 +1574,28 @@ fn pred_de_letra(ch: char) -> (Pred, bool) {
     }
 }
 
-/// Nome de propriedade Unicode (\p{..}) -> categoria aproximada.
-fn prop_de_nome(nome: &str) -> Option<Prop> {
-    for pre in ["Script=", "sc=", "Script_Extensions=", "scx="] {
-        if let Some(sc) = nome.strip_prefix(pre) {
-            return match sc {
-                "Latin" | "Latn" => Some(Prop::Latim),
-                "Greek" | "Grek" => Some(Prop::Grego),
-                "Cyrillic" | "Cyrl" => Some(Prop::Cirilico),
-                "Han" | "Hani" => Some(Prop::Han),
-                _ => None,
-            };
+/// Nome de `\p{..}` -> faixas Unicode oficiais (General_Category, Script, Script_Extensions
+/// ou propriedade binária). Nomes exatos, sem casamento frouxo, como manda o ECMAScript.
+fn prop_de_nome(nome: &str) -> Option<&'static [(u32, u32)]> {
+    use crate::unicode_tabelas as ut;
+    for (pre, ext) in [("Script=", false), ("sc=", false), ("Script_Extensions=", true), ("scx=", true)] {
+        if let Some(v) = nome.strip_prefix(pre) {
+            return ut::SCRIPTS.iter().find(|(al, _, _)| al.contains(&v)).map(|(_, sc, scx)| if ext { *scx } else { *sc });
         }
     }
-    let mut base = nome;
     for pre in ["General_Category=", "gc="] {
-        if let Some(r) = base.strip_prefix(pre) {
-            base = r;
+        if let Some(v) = nome.strip_prefix(pre) {
+            return ut::CATEGORIAS.iter().find(|(al, _)| al.contains(&v)).map(|(_, f)| *f);
         }
     }
-    match base {
-        "L" | "Letter" => Some(Prop::Letra),
-        "Lu" | "Uppercase_Letter" | "Uppercase" | "Upper" => Some(Prop::Maiuscula),
-        "Ll" | "Lowercase_Letter" | "Lowercase" | "Lower" => Some(Prop::Minuscula),
-        "N" | "Number" => Some(Prop::Numero),
-        "Nd" | "Decimal_Number" | "digit" => Some(Prop::Digito),
-        "P" | "Punctuation" => Some(Prop::Pontuacao),
-        "S" | "Symbol" => Some(Prop::Simbolo),
-        "White_Space" | "space" => Some(Prop::Espaco),
-        "Alphabetic" | "Alpha" => Some(Prop::Alfabetico),
-        "ASCII" => Some(Prop::Ascii),
-        "Any" => Some(Prop::Qualquer),
-        _ => None,
+    if nome.contains('=') {
+        return None;
     }
-}
-
-impl Prop {
-    /// shortcut: aproximação com métodos de `char` e faixas fixas, não a tabela Unicode oficial.
-    fn casa(self, x: u32) -> bool {
-        if self == Prop::Qualquer {
-            return true;
-        }
-        let c = match char::from_u32(x) {
-            Some(c) => c,
-            None => return false,
-        };
-        match self {
-            Prop::Qualquer => true,
-            Prop::Ascii => x < 128,
-            Prop::Letra | Prop::Alfabetico => c.is_alphabetic(),
-            Prop::Maiuscula => c.is_uppercase(),
-            Prop::Minuscula => c.is_lowercase(),
-            Prop::Numero | Prop::Digito => c.is_numeric(),
-            Prop::Espaco => c.is_whitespace(),
-            Prop::Pontuacao => {
-                (c.is_ascii_punctuation() && !"$+<=>^`|~".contains(c))
-                    || matches!(
-                        x,
-                        0xA1 | 0xA7 | 0xAB | 0xB6 | 0xB7 | 0xBB | 0xBF
-                            | 0x2010..=0x2027
-                            | 0x2030..=0x205E
-                            | 0x3001..=0x3003
-                    )
-            }
-            Prop::Simbolo => {
-                "$+<=>^`|~".contains(c)
-                    || matches!(
-                        x,
-                        0xA2..=0xA6
-                            | 0xA8
-                            | 0xA9
-                            | 0xAC
-                            | 0xAE..=0xB1
-                            | 0xB4
-                            | 0xD7
-                            | 0xF7
-                            | 0x20A0..=0x20CF
-                            | 0x2100..=0x214F
-                            | 0x2190..=0x2BFF
-                    )
-            }
-            Prop::Latim => matches!(
-                x,
-                0x41..=0x5A
-                    | 0x61..=0x7A
-                    | 0xAA
-                    | 0xBA
-                    | 0xC0..=0xD6
-                    | 0xD8..=0xF6
-                    | 0xF8..=0x24F
-                    | 0x1E00..=0x1EFF
-                    | 0xFF21..=0xFF3A
-                    | 0xFF41..=0xFF5A
-            ),
-            Prop::Grego => matches!(x, 0x370..=0x3FF | 0x1F00..=0x1FFF),
-            Prop::Cirilico => matches!(x, 0x400..=0x52F | 0x2DE0..=0x2DFF | 0xA640..=0xA69F),
-            Prop::Han => matches!(
-                x,
-                0x2E80..=0x2FDF
-                    | 0x3005
-                    | 0x3007
-                    | 0x3021..=0x3029
-                    | 0x3400..=0x4DBF
-                    | 0x4E00..=0x9FFF
-                    | 0xF900..=0xFAFF
-                    | 0x20000..=0x2A6DF
-            ),
-        }
-    }
+    ut::CATEGORIAS
+        .iter()
+        .find(|(al, _)| al.contains(&nome))
+        .or_else(|| ut::BINARIAS.iter().find(|(al, _)| al.contains(&nome)))
+        .map(|(_, f)| *f)
 }
 
 impl Pred {
@@ -1355,7 +1617,7 @@ impl Pred {
                     | 0x3000
                     | 0xFEFF
             ),
-            Pred::Prop(p) => p.casa(x),
+            Pred::Tab(t) => em_faixas(t, x),
         }
     }
 }
@@ -1452,6 +1714,91 @@ fn ch(c: char) -> u32 {
 
 /// Pré-leitura: conta os grupos de captura e recolhe os nomes (1-based).
 /// Precisa do total antes de analisar, para decidir `\N` (retro-referência ou octal).
+/// Nome de grupo: decodifica `\uXXXX`, `\u{..}` e pares substitutos (com ou sem `u`).
+fn decodifica_nome(raw: &[u32]) -> Option<Vec<u32>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        let (mut cp, n) = if raw[i] == ch('\\') {
+            ler_escape_u(raw, i)?
+        } else {
+            (raw[i], 1)
+        };
+        i += n;
+        let alto = (0xD800..0xDC00).contains(&cp);
+        if alto {
+            if let Some((lo, m)) = raw.get(i).filter(|&&c| c == ch('\\')).and_then(|_| ler_escape_u(raw, i)) {
+                if (0xDC00..0xE000).contains(&lo) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    i += m;
+                }
+            } else if let Some(&lo) = raw.get(i).filter(|&&c| (0xDC00..0xE000).contains(&c)) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                i += 1;
+            }
+        }
+        out.push(cp);
+    }
+    Some(out)
+}
+
+/// `\uXXXX` ou `\u{..}` em `raw[i..]`: (ponto de código, unidades consumidas).
+fn ler_escape_u(raw: &[u32], i: usize) -> Option<(u32, usize)> {
+    if raw.get(i) != Some(&ch('\\')) || raw.get(i + 1) != Some(&ch('u')) {
+        return None;
+    }
+    if raw.get(i + 2) == Some(&ch('{')) {
+        let mut j = i + 3;
+        let mut v = 0u32;
+        loop {
+            let c = *raw.get(j)?;
+            if c == ch('}') {
+                break;
+            }
+            v = v.checked_mul(16)?.checked_add(char::from_u32(c)?.to_digit(16)?)?;
+            if v > 0x10FFFF {
+                return None;
+            }
+            j += 1;
+        }
+        return (j > i + 3).then_some((v, j + 1 - i));
+    }
+    let mut v = 0u32;
+    for k in 0..4 {
+        v = v * 16 + char::from_u32(*raw.get(i + 2 + k)?)?.to_digit(16)?;
+    }
+    Some((v, 6))
+}
+
+/// Caractere válido em nome de grupo (IdentifierStart / IdentifierPart do Unicode).
+fn id_nome(c: u32, inicio: bool) -> bool {
+    if c == ch('$') || c == ch('_') {
+        return true;
+    }
+    let tab = |nome: &str| {
+        crate::unicode_tabelas::BINARIAS.iter().find(|(al, _)| al.contains(&nome)).map_or(&[][..], |(_, f)| *f)
+    };
+    if inicio {
+        em_faixas(tab("ID_Start"), c)
+    } else {
+        c == 0x200C || c == 0x200D || em_faixas(tab("ID_Continue"), c)
+    }
+}
+
+/// Busca binária em faixas ordenadas.
+fn em_faixas(t: &[(u32, u32)], x: u32) -> bool {
+    t.binary_search_by(|&(a, b)| {
+        if b < x {
+            std::cmp::Ordering::Less
+        } else if a > x {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    })
+    .is_ok()
+}
+
 fn prescan(p: &[u32]) -> Result<(usize, Vec<(Vec<u32>, usize)>), String> {
     let mut total = 0usize;
     let mut nomes: Vec<(Vec<u32>, usize)> = Vec::new();
@@ -1481,11 +1828,12 @@ fn prescan(p: &[u32]) -> Result<(usize, Vec<(Vec<u32>, usize)>), String> {
             {
                 total += 1;
                 let mut j = i + 3;
-                let mut nome = Vec::new();
+                let mut bruto = Vec::new();
                 while j < p.len() && p[j] != ch('>') {
-                    nome.push(p[j]);
+                    bruto.push(p[j]);
                     j += 1;
                 }
+                let nome = decodifica_nome(&bruto).unwrap_or(bruto);
                 if nomes.iter().any(|(n, _)| *n == nome) {
                     return Err("nome de grupo duplicado".to_string());
                 }
@@ -1496,6 +1844,65 @@ fn prescan(p: &[u32]) -> Result<(usize, Vec<(Vec<u32>, usize)>), String> {
         i += 1;
     }
     Ok((total, nomes))
+}
+
+/// Preenche o `mapa` de cada classe com a resposta de `classe_casa_lento` para 0..256.
+fn preparar(no: &mut No, opc: &Flags) {
+    match no {
+        No::Classe(cl) => {
+            let p = Programa { raiz: No::Seq(Vec::new()), grupos: 0, nomes: Vec::new(), opc: opc.clone(), prefixo: None, primeiros: None };
+            for c in 0..256u32 {
+                if p.classe_casa_lento(cl, c) {
+                    cl.mapa[c as usize >> 6] |= 1 << (c & 63);
+                }
+            }
+        }
+        No::Grupo(n, _) | No::Rep(n, _) | No::Olhar(n, _, _) => preparar(n, opc),
+        No::Alt(v) | No::Seq(v) => v.iter_mut().for_each(|n| preparar(n, opc)),
+        _ => {}
+    }
+}
+
+/// Junta em `ok` as unidades que podem abrir um casamento de `no`. Devolve se `no` pode casar
+/// vazio; None = desiste (algo pode começar fora de 0..256, ou não dá para saber).
+fn primeiros_de(no: &No, opc: &Flags, ok: &mut [u64; 4]) -> Option<bool> {
+    match no {
+        // Com `i`, 'k' casa também U+212A: fica sem atalho.
+        No::Char(c) if *c < 256 && !opc.ignorar_caixa => {
+            ok[*c as usize >> 6] |= 1 << (c & 63);
+            Some(false)
+        }
+        // Só classes que não casam nada >= 256 (uma unidade alta pode ser o início de um par).
+        No::Classe(cl) if !cl.negada && !opc.ignorar_caixa && cl.itens.iter().all(|it| match it {
+            Item::Faixa(_, b) => *b < 256,
+            Item::Pred(Pred::Dig, false) | Item::Pred(Pred::Pal, false) => true,
+            _ => false,
+        }) => {
+            for (o, m) in ok.iter_mut().zip(cl.mapa) {
+                *o |= m;
+            }
+            Some(false)
+        }
+        No::Inicio | No::Fim | No::Fronteira(_) | No::Olhar(..) => Some(true),
+        No::Grupo(n, _) => primeiros_de(n, opc, ok),
+        No::Rep(n, q) => Some(primeiros_de(n, opc, ok)? || q.min == 0),
+        No::Seq(v) => {
+            for n in v {
+                if !primeiros_de(n, opc, ok)? {
+                    return Some(false);
+                }
+            }
+            Some(true)
+        }
+        No::Alt(v) => {
+            let mut vazio = false;
+            for n in v {
+                vazio |= primeiros_de(n, opc, ok)?;
+            }
+            Some(vazio)
+        }
+        _ => None,
+    }
 }
 
 /// Primeiro caractere obrigatório do padrão, para o atalho de `procurar`.
@@ -1525,6 +1932,20 @@ mod testes {
             Ok(f) => Programa::compilar(&u(p), &f).is_err(),
             Err(_) => true,
         }
+    }
+
+    #[test]
+    fn atalho_do_primeiro_caractere_nao_muda_o_resultado() {
+        assert!(prog("[a-z0-9]+@x", "").primeiros.is_some());
+        assert_eq!(prog("[a-z0-9]+@x", "").procurar(&u(", ab@x"), 0), Some(vec![Some((2, 6))]));
+        assert_eq!(prog("(?:\\d|z)+", "").procurar(&u("..z12"), 0), Some(vec![Some((2, 5))]));
+        assert_eq!(prog("(?<=\\$)\\d+", "").procurar(&u("1$23"), 0), Some(vec![Some((2, 4))]));
+        // Pode casar vazio, casa fora de 0..256 ou usa `i`: sem atalho.
+        assert!(prog("a*", "").primeiros.is_none());
+        assert!(prog("[^a]", "").primeiros.is_none());
+        assert!(prog("k", "iu").primeiros.is_none());
+        assert!(prog("k", "iu").procurar(&u("\u{212A}"), 0).is_some());
+        assert_eq!(prog("[a-c]+", "i").procurar(&u("xBcA"), 0), Some(vec![Some((1, 4))]));
     }
 
     #[test]
@@ -1644,6 +2065,37 @@ mod testes {
     #[test]
     fn propriedade_unicode() {
         assert_eq!(prog("\\p{Lu}", "u").procurar(&u("aB"), 0), Some(vec![Some((1, 2))]));
+    }
+
+    #[test]
+    fn propriedades_unicode_oficiais() {
+        let casa = |p: &str, t: &str| prog(p, "u").casar_em(&u(t), 0).is_some();
+        assert!(casa("\\p{Script=Greek}", "α") && !casa("\\p{sc=Greek}", "a"));
+        assert!(casa("\\p{scx=Hira}", "\u{30FC}") && casa("\\p{Script_Extensions=Zyyy}", "1"));
+        assert!(casa("\\p{ID_Start}", "ß") && !casa("\\p{ID_Start}", "1") && casa("\\p{ID_Continue}", "1"));
+        assert!(casa("\\p{Emoji}", "\u{1F600}") && casa("\\p{Any}", "\u{10FFFF}"));
+        assert!(!casa("\\p{Assigned}", "\u{378}") && casa("\\p{Cn}", "\u{378}"));
+        assert!(casa("\\p{Cased_Letter}", "A") && casa("\\p{LC}", "a") && !casa("\\P{Ll}", "a"));
+        // Nomes exatos: sem frouxidão, sem `=` em propriedade binária, sem nomes fora da lista.
+        assert!(erro("\\p{ASCII=T}", "u") && erro("\\p{Hyphen}", "u") && erro("\\p{lu}", "u"));
+        assert!(erro("\\p{Script}", "u") && erro("\\p{Line_Break=Alphabetic}", "u"));
+    }
+
+    #[test]
+    fn modo_v_operacoes_de_conjunto() {
+        let casa = |p: &str, t: &str| prog(p, "v").casar_em(&u(t), 0).is_some();
+        assert!(casa("[\\d--[0-5]]", "7") && !casa("[\\d--[0-5]]", "3"));
+        assert!(casa("[\\d&&[0-5]]", "3") && !casa("[\\d&&[0-5]]", "7"));
+        assert!(casa("^[[a-z]--[aeiou]]+$", "bcd") && !casa("^[[a-z]--[aeiou]]+$", "bad"));
+        assert!(casa("[\\p{ASCII}--[a-z]]", "A") && !casa("[\\p{ASCII}--[a-z]]", "q"));
+        assert!(casa("^[^\\d]$", "x") && !casa("^[^\\d]$", "1"));
+        // `\q{..}`: a cadeia mais longa primeiro.
+        assert_eq!(prog("[\\q{abc|d}]", "v").procurar(&u("xabcd"), 0), Some(vec![Some((1, 4))]));
+        assert_eq!(prog("[\\q{ab}x]", "v").procurar(&u("xab"), 0), Some(vec![Some((0, 1))]));
+        assert_eq!(prog("[\\q{ab}--\\q{ab}]", "v").procurar(&u("ab"), 0), None);
+        // Sintaxe do modo v: operadores misturados, `-` solto e pontuadores duplos são erro.
+        assert!(erro("[a&&b--c]", "v") && erro("[a-]", "v") && erro("[a&&&b]", "v") && erro("[a&&!!b]", "v"));
+        assert!(erro("[^\\q{ab}]", "v") && erro("[a-c&&b-d]", "v") && erro("\\q{a}", "v"));
     }
 
     #[test]

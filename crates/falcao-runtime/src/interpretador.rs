@@ -7,7 +7,7 @@
 //! Se vieram mais argumentos que parâmetros, eles ficam logo antes de `base` (para `arguments`).
 
 use crate::formas::{attr, Chave, Classe};
-use crate::funcoes::{Args, ConstRt, Res, BIT_NATIVA, F_CASA, F_CODIGO, F_CONTEXTO, F_THIS};
+use crate::funcoes::{tipo, Args, CacheProp, ConstRt, Res, BIT_NATIVA, F_CASA, F_CODIGO, F_CONTEXTO, F_THIS, MEGA, SEM_POLI};
 use crate::intrinsecos::simb;
 use crate::motor::Motor;
 use crate::nomes::fixos;
@@ -17,6 +17,13 @@ use crate::valor::Valor;
 use falcao_bytecode::instrucoes::{ler_operando, Operando};
 use falcao_bytecode::{Constante, Op};
 use std::rc::Rc;
+
+/// Endereço de uma variável local: o topo atual da pilha do Rust (ela cresce para baixo).
+#[inline(always)]
+fn endereco_pilha() -> usize {
+    let x = 0u8;
+    std::hint::black_box(&x) as *const u8 as usize
+}
 
 /// Sem gerador/async ligado ao quadro.
 pub const SEM_SUSPENSO: u32 = u32::MAX;
@@ -48,15 +55,39 @@ pub struct QuadroSalvo {
     pub quadro: Quadro,
     /// `pilha[topo..fim]`.
     pub valores: Vec<Valor>,
-    /// Promessa da função async (undefined em gerador).
+    /// Promessa da função async (undefined em gerador; o objeto, em gerador async).
     pub promessa: Valor,
+    /// Por que parou: [`RENDEU`], [`AGUARDA`] ou [`RENDEU_CRU`].
+    pub modo: u8,
 }
+
+/// Parou num `yield` (o valor vira `{value, done: false}`).
+pub const RENDEU: u8 = 0;
+/// Parou num `await`.
+pub const AGUARDA: u8 = 1;
+/// `yield*` de gerador comum: o resultado do iterador de dentro sai como está.
+pub const RENDEU_CRU: u8 = 2;
+
+/// Como o `yield`/`yield*` parado foi retomado (lido por `ModoRetomada`/`Delega`).
+const RETOMOU_NORMAL: u8 = 0;
+const RETOMOU_LANCA: u8 = 1;
+const RETOMOU_RETORNA: u8 = 2;
 
 /// Como um laço termina.
 #[derive(Clone, Copy, Debug)]
 pub enum Fim {
     Retorno(Valor),
     Suspenso(Valor),
+}
+
+/// Resultado de um passo do `yield*`.
+enum Passo {
+    /// O de dentro acabou: valor do `yield*`.
+    Fim(Valor),
+    /// Retomado com `return` e o de dentro acabou (ou não tem `return`): a função retorna.
+    Retorno(Valor),
+    /// Para o quadro com o valor, pelo motivo dado.
+    Para(Valor, u8),
 }
 
 /// Como o quadro do topo recomeça.
@@ -160,33 +191,45 @@ impl Motor {
         self.gravar(g, k, v, estrito)
     }
 
-    /// Busca dinâmica (`with`): os objetos de `with` da corrente, depois o global.
-    fn ler_dinamico(&mut self, mut ctx: Valor, c: Chave, typeof_: bool) -> Res<Valor> {
+    /// O objeto de `with` mais próximo, nos `n` primeiros contextos, que tem o nome (HasBinding,
+    /// §9.1.1.2.1: `Symbol.unscopables` esconde o nome).
+    fn com_que_tem(&mut self, mut ctx: Valor, c: Chave, mut n: u32) -> Res<Option<Valor>> {
         let k = ChaveProp::Nome(c);
-        while ctx != Valor::UNDEFINED {
+        while ctx != Valor::UNDEFINED && n > 0 {
             if self.g.u32_em(ctx.deslocamento() + 4) & CTX_COM != 0 {
                 let o = self.ctx_ler(ctx, 0);
                 if self.tem(o, k)? {
-                    return self.obter(o, k);
+                    let u = self.obter(o, ChaveProp::Nome(simb::UNSCOPABLES))?;
+                    let escondido = if self.e_objeto(u) {
+                        let x = self.obter(u, k)?;
+                        self.verdadeiro(x)
+                    } else {
+                        false
+                    };
+                    if !escondido {
+                        return Ok(Some(o));
+                    }
                 }
             }
             ctx = self.ctx_pai(ctx);
+            n -= 1;
         }
-        self.ler_global(c, typeof_)
+        Ok(None)
     }
 
-    fn gravar_dinamico(&mut self, mut ctx: Valor, c: Chave, v: Valor, estrito: bool) -> Res<()> {
-        let k = ChaveProp::Nome(c);
-        while ctx != Valor::UNDEFINED {
-            if self.g.u32_em(ctx.deslocamento() + 4) & CTX_COM != 0 {
-                let o = self.ctx_ler(ctx, 0);
-                if self.tem(o, k)? {
-                    return self.gravar(o, k, v, estrito);
-                }
-            }
-            ctx = self.ctx_pai(ctx);
+    /// Busca dinâmica (`with`): os objetos de `with` da corrente, depois o global.
+    fn ler_dinamico(&mut self, ctx: Valor, c: Chave, typeof_: bool) -> Res<Valor> {
+        match self.com_que_tem(ctx, c, u32::MAX)? {
+            Some(o) => self.obter(o, ChaveProp::Nome(c)),
+            None => self.ler_global(c, typeof_),
         }
-        self.gravar_global(c, v, estrito)
+    }
+
+    fn gravar_dinamico(&mut self, ctx: Valor, c: Chave, v: Valor, estrito: bool) -> Res<()> {
+        match self.com_que_tem(ctx, c, u32::MAX)? {
+            Some(o) => self.gravar(o, ChaveProp::Nome(c), v, estrito),
+            None => self.gravar_global(c, v, estrito),
+        }
     }
 
     // ---------------------------------------------------------------- pilha de chamadas
@@ -280,12 +323,14 @@ impl Motor {
             construindo,
             suspenso: SEM_SUSPENSO,
         });
-        self.protos[proto as usize].chamadas += 1;
+        let p = &mut self.protos[proto as usize];
+        p.chamadas = p.chamadas.saturating_add(1);
         Ok(())
     }
 
     /// Chama `f`. `Some(v)`: terminou (nativa); `None`: empurrou um quadro de bytecode.
     pub(crate) fn entrar(&mut self, f: Valor, this: Valor, args: Args) -> Res<Option<Valor>> {
+        self.checar_pilha()?;
         if !self.e_objeto(f) {
             return self.nao_e_funcao(f);
         }
@@ -299,10 +344,8 @@ impl Motor {
                 if fl.construtor_classe {
                     return self.erro_tipo("Class constructor cannot be invoked without 'new'");
                 }
-                if fl.assincrona {
-                    if fl.gerador {
-                        return self.erro_tipo("geradores assíncronos ainda não são suportados no Falcão");
-                    }
+                // Gerador async começa como gerador: `IniciaGerador` cria o objeto.
+                if fl.assincrona && !fl.gerador {
                     return self.iniciar_async(f, this, args).map(Some);
                 }
                 self.empurrar_quadro(f, this, args, Valor::UNDEFINED, false)?;
@@ -359,12 +402,13 @@ impl Motor {
 
     fn chamar_nativa(&mut self, id: u32, f: Valor, this: Valor, args: Args, nt: Valor) -> Res<Valor> {
         let nf = self.nativas[id as usize].f;
-        let antes = self.chamado;
+        // Em raízes: a nativa pode coletar ([`Motor::chamar_coletavel`]).
+        self.raizes.push(self.chamado);
         self.chamado = f;
         self.aninhamento += 1;
         let r = nf(self, this, args, nt);
         self.aninhamento -= 1;
-        self.chamado = antes;
+        self.chamado = self.raizes.pop().unwrap();
         r
     }
 
@@ -385,6 +429,7 @@ impl Motor {
 
     /// `new f(...args)` com `new.target = nt`. `None`: empurrou quadro de bytecode.
     pub(crate) fn construir_no_laco(&mut self, f: Valor, args: Args, nt: Valor) -> Res<Option<Valor>> {
+        self.checar_pilha()?;
         if !self.e_construtor(f) {
             let d = self.descrever(f);
             return self.erro_tipo(&format!("{d} is not a constructor"));
@@ -436,27 +481,44 @@ impl Motor {
         Ok(self.novo_objeto(forma))
     }
 
-    /// Inicia os campos de instância da classe `f` em `o`.
+    /// InitializeInstanceElements: os métodos e acessores privados da classe `f` em `o`, depois
+    /// os campos na ordem. A lista é (chave, valor, tipo) por elemento (ver `DefCampo`).
     pub fn rodar_campos(&mut self, f: Valor, o: Valor) -> Res<()> {
         let Some(d) = self.propria(f, simb::CAMPOS) else { return Ok(()) };
         let lista = self.ler_campo(f, d.slot);
-        let n = self.lista_len(lista);
-        let mut i = 0;
-        while i + 1 < n {
-            let (k, init) = (self.lista_get(lista, i), self.lista_get(lista, i + 1));
-            let v = if init == Valor::UNDEFINED { Valor::UNDEFINED } else { self.chamar(init, o, &[])? };
-            let k = self.para_chave(k)?;
-            match k {
-                ChaveProp::Nome(c) if c.e_simbolo() && self.escondidos.contains(&(c.0 & !Chave::BIT_SIMBOLO)) => {
-                    self.definir_propria(o, c, v, attr::GRAVAVEL);
-                }
-                _ => {
-                    if !self.criar_dado(o, k, v)? {
-                        return self.erro_tipo("Cannot define class field");
-                    }
-                }
+        let n = self.lista_len(lista) / 3;
+        let item = |m: &Self, i: u32| (m.lista_get(lista, 3 * i), m.lista_get(lista, 3 * i + 1), m.lista_get(lista, 3 * i + 2).como_int() as u32);
+        // Objeto que já tem os métodos (o mesmo objeto iniciado duas vezes): TypeError antes de
+        // pôr qualquer coisa.
+        for i in 0..n {
+            let (k, _, t) = item(self, i);
+            if matches!(t, 1..=3) && self.privado(o, k).is_some() {
+                return self.erro_tipo("Cannot initialize private methods twice on the same object");
             }
-            i += 2;
+        }
+        for i in 0..n {
+            let (k, v, t) = item(self, i);
+            if matches!(t, 1..=3) {
+                self.acrescentar_privado(o, k, v, t)?;
+            }
+        }
+        for i in 0..n {
+            let (k, init, t) = item(self, i);
+            if matches!(t, 1..=3) {
+                continue;
+            }
+            let v = if init == Valor::UNDEFINED { Valor::UNDEFINED } else { self.chamar(init, o, &[])? };
+            if t == 4 {
+                self.nomear_funcao(v, k, 0)?;
+            }
+            if self.e_simbolo(k) && self.escondidos.contains(&(self.chave_do_simbolo(k).0 & !Chave::BIT_SIMBOLO)) {
+                self.acrescentar_privado(o, k, v, 0)?;
+                continue;
+            }
+            let k = self.para_chave(k)?;
+            if !self.criar_dado(o, k, v)? {
+                return self.erro_tipo("Cannot define class field");
+            }
         }
         Ok(())
     }
@@ -469,17 +531,92 @@ impl Motor {
         Args { base, n: args.len() as u32 }
     }
 
+    /// Cada laço aberto por nativa (getter, `toString`, callback de `map`, Proxy) gasta ~1 KB
+    /// da pilha do Rust, fora da conta dos 10.000 quadros: 1000 cabe numa thread de 2 MB.
+    /// Recursão dentro do Rust (Proxy de Proxy, `bind` de `bind`, JSON fundo) não passa pela
+    /// pilha de quadros: confere quanto da pilha do Rust já foi usado desde a entrada.
+    pub(crate) fn checar_pilha(&mut self) -> Res<()> {
+        if self.base_pilha != 0 && self.base_pilha.saturating_sub(endereco_pilha()) > self.limite_pilha {
+            return self.erro_alcance("Maximum call stack size exceeded");
+        }
+        Ok(())
+    }
+
+    /// Uma volta de laço longo dentro de nativa (`[].join` com length enorme, `indexOf` em
+    /// objeto com length 1e15): olha o `interromper` como `SaltaAtras` (senão o botão Parar
+    /// não alcança) e o teto da gaiola (lá dentro o coletor não roda).
+    #[inline]
+    pub(crate) fn tique(&mut self) -> Res<()> {
+        self.voltas = self.voltas.wrapping_add(1);
+        if self.voltas & 0xFFFF == 0 {
+            if let Some(motivo) = self.interromper.as_mut().and_then(|f| f()) {
+                return Err(self.erro(crate::intrinsecos::TipoErro::Erro, &motivo));
+            }
+            if !self.g.cabe(0) && !self.terminando {
+                return self.sem_memoria_erro().map(|_| ());
+            }
+        }
+        Ok(())
+    }
+
+    /// `n ± 1` de um valor já numérico (`++`/`--`).
+    /// O int32 de um número que já é inteiro de 32 bits (inteiro pequeno ou caixa); senão None.
+    #[inline]
+    fn int32_de(&self, v: Valor) -> Option<i32> {
+        if v.e_int() {
+            return Some(v.como_int());
+        }
+        if !self.e_numero(v) {
+            return None;
+        }
+        let x = self.f64_de(v);
+        let i = x as i32;
+        (f64::from(i) == x).then_some(i)
+    }
+
+    fn mais_um(&mut self, n: Valor, mais: bool) -> Res<Valor> {
+        let d = if mais { 1 } else { -1 };
+        if self.e_bigint(n) {
+            let x = self.ler_bigint(n).somar(&crate::grande::Grande::de_i64(i64::from(d)));
+            return Ok(self.novo_bigint(&x));
+        }
+        let n = if n.e_int() { n } else { self.para_numero_valor(n)? };
+        self.somar_int(n, d)
+    }
+
+    fn checar_aninhamento(&mut self) -> Res<()> {
+        if self.aninhamento > 1000 {
+            return self.erro_alcance("Maximum call stack size exceeded");
+        }
+        Ok(())
+    }
+
     /// Chama `f(this, ...args)` de dentro do motor (nativas, conversões).
     pub fn chamar(&mut self, f: Valor, this: Valor, args: &[Valor]) -> Res<Valor> {
+        self.checar_aninhamento()?;
         self.aninhamento += 1;
         let r = self.chamar_externo(f, this, args);
         self.aninhamento -= 1;
         r
     }
 
+    /// [`Motor::chamar`] de nativa que guarda em `raizes` tudo o que usa depois da chamada
+    /// (inclusive o `this` e os argumentos que recebeu): o coletor pode rodar lá dentro. Conta
+    /// como seguros o nível desta chamada e o da nativa logo abaixo.
+    pub(crate) fn chamar_coletavel(&mut self, f: Valor, this: Valor, args: &[Valor]) -> Res<Valor> {
+        self.seguro += 2;
+        let r = self.chamar(f, this, args);
+        self.seguro -= 2;
+        r
+    }
+
     /// Chamada vinda de fora (o embutidor). Não pode haver `Valor` solto no Rust durante ela
     /// além dos registrados em raízes: o coletor pode rodar.
     pub fn chamar_externo(&mut self, f: Valor, this: Valor, args: &[Valor]) -> Res<Valor> {
+        let externo = self.base_pilha == 0;
+        if externo {
+            self.base_pilha = endereco_pilha();
+        }
         let marca = self.pilha.len();
         let a = self.empurrar_args(args);
         let r = match self.entrar(f, this, a) {
@@ -494,11 +631,15 @@ impl Motor {
             Err(e) => Err(e),
         };
         self.pilha.truncate(marca);
+        if externo {
+            self.base_pilha = 0;
+        }
         r
     }
 
     /// `new f(...args)` de dentro do motor.
     pub fn construir(&mut self, f: Valor, args: &[Valor], nt: Valor) -> Res<Valor> {
+        self.checar_aninhamento()?;
         let marca = self.pilha.len();
         self.aninhamento += 1;
         let a = self.empurrar_args(args);
@@ -557,7 +698,12 @@ impl Motor {
             Ok((arvore, lexico)) => {
                 let esc = falcao_sintaxe::analisar_escopos(&arvore);
                 match falcao_bytecode::compilar(&arvore, &esc, &lexico) {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        if let Err(m) = crate::regex::validar_literais(&s) {
+                            return Err(self.erro(crate::intrinsecos::TipoErro::Sintaxe, &format!("Invalid regular expression: {m}")));
+                        }
+                        s
+                    }
                     Err(e) => return Err(self.erro(crate::intrinsecos::TipoErro::Sintaxe, &e.mensagem)),
                 }
             }
@@ -599,7 +745,7 @@ impl Motor {
         q.pc = pc;
         let valores = self.pilha[q.topo as usize..q.fim as usize].to_vec();
         self.pilha.truncate(q.topo as usize);
-        QuadroSalvo { quadro: q, valores, promessa: Valor::UNDEFINED }
+        QuadroSalvo { quadro: q, valores, promessa: Valor::UNDEFINED, modo: RENDEU }
     }
 
     /// Continua um gerador/async parado.
@@ -651,6 +797,9 @@ impl Motor {
     /// Depois que uma async parou: resolve, rejeita ou espera a promessa do `await`.
     pub(crate) fn depois_async(&mut self, id: u32, r: Res<Fim>) {
         let p = self.promessas_async.remove(&id).unwrap_or(Valor::UNDEFINED);
+        if self.e_gerador_async(p) {
+            return self.depois_gerador_async(p, id, r);
+        }
         match r {
             Ok(Fim::Retorno(v)) => {
                 self.liberar_suspenso(id);
@@ -664,8 +813,19 @@ impl Motor {
                 if let Some(s) = self.suspensos[id as usize].as_mut() {
                     s.promessa = p;
                 }
-                let espera = self.promessa_de(v);
-                self.reagir_async(espera, id);
+                self.aguardar(id, v);
+            }
+        }
+    }
+
+    /// Await(v) da async/gerador async `id` (já guardado): PromiseResolve pode lançar (o
+    /// `constructor` é lido), e aí o erro volta na hora para dentro da função.
+    pub(crate) fn aguardar(&mut self, id: u32, v: Valor) {
+        match self.promessa_resolve(v) {
+            Ok(espera) => self.reagir_async(espera, id),
+            Err(e) => {
+                let r = self.retomar(id, Entrada::Lanca(e));
+                self.depois_async(id, r);
             }
         }
     }
@@ -681,7 +841,8 @@ impl Motor {
             exato = false;
             let p = &self.protos[q.proto as usize];
             let fb = &p.script.funcoes[p.indice as usize];
-            if let Some(x) = fb.excecoes.iter().find(|x| x.inicio <= pc && pc < x.fim).copied() {
+            let tratador = if self.terminando { None } else { fb.excecoes.iter().find(|x| x.inicio <= pc && pc < x.fim).copied() };
+            if let Some(x) = tratador {
                 let q = self.quadros.last_mut().unwrap();
                 let mut c = q.contexto;
                 let mut n = q.contextos;
@@ -698,6 +859,9 @@ impl Motor {
             let q = self.quadros.pop().unwrap();
             self.pilha.truncate(q.topo as usize);
             if q.entrada {
+                if self.aninhamento == 0 {
+                    self.terminando = false;
+                }
                 return Err(e);
             }
         }
@@ -710,13 +874,28 @@ impl Motor {
     pub(crate) fn laco(&mut self, ent: Entrada) -> Res<Fim> {
         let mut acc = Valor::UNDEFINED;
         let mut pendente: Option<(Valor, bool)> = None;
+        // `yield` (ModoRetomada) e `yield*` (Delega) tratam o throw/return eles mesmos.
+        let mut retomada = RETOMOU_NORMAL;
         match ent {
             Entrada::Normal(v) => acc = v,
-            Entrada::Lanca(e) => pendente = Some((e, false)),
+            Entrada::Lanca(e) => {
+                if self.parado_em(&[Op::Delega]) {
+                    acc = e;
+                    retomada = RETOMOU_LANCA;
+                } else {
+                    pendente = Some((e, false));
+                }
+            }
             Entrada::Retorna(v) => {
-                let q = self.quadros.pop().unwrap();
-                self.pilha.truncate(q.topo as usize);
-                return Ok(Fim::Retorno(v));
+                if self.parado_em(&[Op::Delega, Op::ModoRetomada]) {
+                    acc = v;
+                    retomada = RETOMOU_RETORNA;
+                } else {
+                    // Gerador que nem começou: acaba sem rodar nada.
+                    let q = self.quadros.pop().unwrap();
+                    self.pilha.truncate(q.topo as usize);
+                    return Ok(Fim::Retorno(v));
+                }
             }
         }
         'quadro: loop {
@@ -727,8 +906,12 @@ impl Motor {
                 }
             }
             // Ponto seguro das chamadas e retornos (o das voltas de laço fica em `SaltaAtras`).
-            if self.g.coleta_pendente && self.aninhamento == 0 {
+            if self.g.coleta_pendente && self.pode_coletar() {
                 acc = self.ponto_seguro(acc);
+            }
+            if self.sem_memoria(&mut acc) {
+                pendente = Some((self.sem_memoria_erro().unwrap_err(), false));
+                continue 'quadro;
             }
             let qi = self.quadros.len() - 1;
             let q = self.quadros[qi];
@@ -743,6 +926,14 @@ impl Motor {
             macro_rules! reg {
                 ($r:expr) => {
                     self.pilha[base + $r as usize]
+                };
+            }
+            // Feedback de tipos do caminho lento; cache estável só custa ler um byte.
+            macro_rules! anotar {
+                ($c:expr, $a:expr, $b:expr, $r:expr) => {
+                    if self.protos[proto].tipos[$c as usize] < tipo::ESTAVEL {
+                        self.anotar(proto, $c, $a, $b, $r)
+                    }
                 };
             }
 
@@ -775,7 +966,8 @@ impl Motor {
                 }
                 macro_rules! i4 {
                     () => {{
-                        let v = i32::from_le_bytes([codigo[pc], codigo[pc + 1], codigo[pc + 2], codigo[pc + 3]]);
+                        // Uma checagem de limite e uma leitura, não quatro.
+                        let v = i32::from_le_bytes(codigo[pc..pc + 4].try_into().unwrap());
                         pc += 4;
                         v
                     }};
@@ -805,6 +997,43 @@ impl Motor {
                         self.quadros[qi].pc = pc as u32;
                     };
                 }
+                // O resto do `SaltaAtras` (já com `pc` no alvo): perfil, interrupção, coleta.
+                macro_rules! volta {
+                    () => {
+                        self.voltas = self.voltas.wrapping_add(1);
+                        // Calor por amostra: a função que roda na volta 256ª leva as 256.
+                        if self.voltas & 0xFF == 0 {
+                            let p = &mut self.protos[proto];
+                            p.voltas = p.voltas.saturating_add(256);
+                        }
+                        if self.voltas & 0xFFFF == 0 {
+                            if let Some(motivo) = self.interromper.as_mut().and_then(|f| f()) {
+                                let e = self.erro(crate::intrinsecos::TipoErro::Erro, &motivo);
+                                t!(Err::<Valor, Valor>(e));
+                            }
+                        }
+                        if self.g.coleta_pendente && self.pode_coletar() {
+                            salvar_pc!();
+                            acc = self.ponto_seguro(acc);
+                        }
+                        if self.sem_memoria(&mut acc) {
+                            t!(self.sem_memoria_erro());
+                        }
+                    };
+                }
+                // Comparação de inteiros já feita; se a próxima instrução é um salto condicional
+                // (a condição de todo laço), salta aqui mesmo.
+                macro_rules! comparou {
+                    ($sim:expr) => {
+                        let sim = $sim;
+                        acc = Valor::bool(sim);
+                        let prox = codigo.get(pc).copied();
+                        if prox == Some(Op::SaltaSeFalso as u8) || prox == Some(Op::SaltaSeVerdadeiro as u8) {
+                            let alvo = i32::from_le_bytes(codigo[pc + 1..pc + 5].try_into().unwrap()) as u32 as usize;
+                            pc = if sim == (prox == Some(Op::SaltaSeVerdadeiro as u8)) { alvo } else { pc + 5 };
+                        }
+                    };
+                }
                 // Chamada: Some(v) = acc; None = quadro novo.
                 macro_rules! depois_de_chamar {
                     ($r:expr) => {
@@ -828,7 +1057,25 @@ impl Motor {
                     Op::CarregaVerdadeiro => acc = Valor::TRUE,
                     Op::CarregaFalso => acc = Valor::FALSE,
                     Op::CarregaBuraco => acc = Valor::BURACO,
-                    Op::CarregaInt => acc = Valor::int(i4!()),
+                    Op::CarregaInt => {
+                        let y = i4!();
+                        acc = Valor::int(y);
+                        // `i < N`: carregar a constante, comparar com o registrador e saltar de uma vez.
+                        let o = codigo.get(pc).copied().unwrap_or(0);
+                        if (Op::Menor as u8..=Op::MaiorIgual as u8).contains(&o) {
+                            let a = reg!(codigo[pc + 1]);
+                            if a.e_int() {
+                                let x = a.como_int();
+                                pc += 3;
+                                comparou!(match o {
+                                    o if o == Op::Menor as u8 => x < y,
+                                    o if o == Op::Maior as u8 => x > y,
+                                    o if o == Op::MenorIgual as u8 => x <= y,
+                                    _ => x >= y,
+                                });
+                            }
+                        }
+                    }
                     Op::CarregaConst => {
                         let k = u!();
                         acc = t!(self.constante(proto, k));
@@ -846,6 +1093,9 @@ impl Motor {
                         let q = self.quadros[qi];
                         let fl = fb.flags;
                         acc = if fl.seta { Valor(self.interno(q.funcao, F_THIS)) } else { q.this };
+                        if (fl.seta || fl.classe_derivada) && self.celula_this(acc) {
+                            acc = self.lista_get(acc, 0);
+                        }
                         if acc == Valor::BURACO {
                             t!(self.erro_referencia::<()>("Must call super constructor in derived class before accessing 'this' or returning from derived constructor"));
                         }
@@ -999,6 +1249,13 @@ impl Motor {
                         let ctx = self.quadros[qi].contexto;
                         t!(self.gravar_dinamico(ctx, c, acc, estrito));
                     }
+                    Op::TemCom => {
+                        let (k, n) = (u!(), u!());
+                        let c = nome!(k);
+                        let ctx = self.quadros[qi].contexto;
+                        let n = if n == 0xffff { u32::MAX } else { n };
+                        acc = Valor::bool(t!(self.com_que_tem(ctx, c, n)).is_some());
+                    }
                     Op::ChecaTdz => {
                         let k = u!();
                         if acc == Valor::BURACO {
@@ -1031,13 +1288,8 @@ impl Motor {
                                 continue 'exec;
                             }
                         }
-                        if !self.e_objeto(o) && o.e_nulo_ou_indefinido() {
-                            let k = t!(self.para_chave(acc));
-                            acc = t!(self.obter(o, k));
-                        } else {
-                            let k = t!(self.para_chave(acc));
-                            acc = t!(self.obter(o, k));
-                        }
+                        let k = t!(self.para_chave(acc));
+                        acc = t!(self.obter(o, k));
                     }
                     Op::GravaItem => {
                         let (r0, r1, _ci) = (u!(), u!(), u!());
@@ -1103,39 +1355,30 @@ impl Motor {
                         t!(self.gravar_com(p, k, v, this));
                     }
                     Op::LePrivado => {
-                        let (r, k) = (u!(), u!());
-                        let o = reg!(r);
-                        let c = self.chave_privada(nome!(k));
-                        if !self.e_objeto(o) || !t!(self.tem(o, ChaveProp::Nome(c))) {
-                            t!(self.erro_tipo::<()>("Cannot read private member from an object whose class did not declare it"));
-                        }
-                        acc = t!(self.obter(o, ChaveProp::Nome(c)));
+                        let (r0, r1) = (u!(), u!());
+                        acc = t!(self.ler_privado(reg!(r0), reg!(r1)));
                     }
                     Op::GravaPrivado => {
-                        let (r, k) = (u!(), u!());
-                        let o = reg!(r);
-                        let c = self.chave_privada(nome!(k));
-                        if !self.e_objeto(o) || !t!(self.tem(o, ChaveProp::Nome(c))) {
-                            t!(self.erro_tipo::<()>("Cannot write private member to an object whose class did not declare it"));
-                        }
-                        t!(self.gravar(o, ChaveProp::Nome(c), acc, true));
+                        let (r0, r1) = (u!(), u!());
+                        t!(self.gravar_privado(reg!(r0), reg!(r1), acc));
                     }
                     Op::TemPrivado => {
-                        let k = u!();
-                        let c = self.chave_privada(nome!(k));
+                        let c = self.chave_do_simbolo(reg!(u!()));
                         if !self.e_objeto(acc) {
                             t!(self.erro_tipo::<()>("Cannot use 'in' operator to search for a private field in a non-object"));
                         }
-                        acc = Valor::bool(t!(self.tem(acc, ChaveProp::Nome(c))));
+                        acc = Valor::bool(self.propria(acc, c).is_some());
                     }
                     Op::DefinePrivado => {
-                        let (r, k) = (u!(), u!());
-                        let c = self.chave_privada(nome!(k));
-                        self.definir_propria(reg!(r), c, acc, attr::GRAVAVEL);
+                        let (r0, r1, n) = (u!(), u!(), u!());
+                        t!(self.acrescentar_privado(reg!(r0), reg!(r1), acc, n));
                     }
-                    Op::ChavePrivada => {
-                        let c = self.chave_privada(nome!(u!()));
-                        acc = self.simbolos[(c.0 & !Chave::BIT_SIMBOLO) as usize];
+                    Op::NovoPrivado => {
+                        let d = t!(self.constante(proto, u!()));
+                        let s = self.novo_simbolo(d);
+                        let k = self.chave_do_simbolo(s);
+                        self.escondidos.insert(k.0 & !Chave::BIT_SIMBOLO);
+                        acc = s;
                     }
 
                     // ---- literais ----
@@ -1155,18 +1398,32 @@ impl Motor {
                         acc = self.novo_objeto(f);
                     }
                     Op::DefProp => {
-                        let (r, k) = (u!(), u!());
-                        let c = nome!(k);
-                        self.definir_propria(reg!(r), c, acc, attr::PADRAO);
+                        // Cache de transição do objeto literal: forma de antes (`forma`), forma
+                        // depois (`forma_dono`) e o slot do campo novo.
+                        let (r, k, ci) = (u!(), u!(), u!());
+                        let (o, c) = (reg!(r), nome!(k));
+                        let antes = self.forma(o).0;
+                        let e = self.protos[proto].caches[ci as usize];
+                        if e.forma == antes {
+                            self.g.por_u32(o.deslocamento(), e.forma_dono);
+                            self.gravar_campo(o, e.deslocamento, acc);
+                        } else {
+                            self.definir_propria(o, c, acc, attr::PADRAO);
+                            let depois = self.forma(o);
+                            if depois.0 != antes && !self.formas.get(depois).dicionario {
+                                if let Some(d) = self.formas.procurar(depois, c) {
+                                    let e = &mut self.protos[proto].caches[ci as usize];
+                                    (e.forma, e.forma_dono, e.deslocamento) = (antes, depois.0, d.slot);
+                                }
+                            }
+                        }
                     }
                     Op::DefItem => {
                         let (r0, r1) = (u!(), u!());
                         let k = t!(self.para_chave(reg!(r1)));
-                        let o = reg!(r0);
-                        if let ChaveProp::Nome(c) = k {
-                            self.definir_propria(o, c, acc, attr::PADRAO);
-                        } else {
-                            t!(self.criar_dado(o, k, acc));
+                        // CreateDataPropertyOrThrow: `static ['prototype'] = 1` (não configurável) é TypeError.
+                        if !t!(self.criar_dado(reg!(r0), k, acc)) {
+                            t!(self.erro_tipo::<()>("Cannot redefine property"));
                         }
                     }
                     Op::Empurra => {
@@ -1236,7 +1493,17 @@ impl Motor {
                         let k = u!();
                         let ConstRt::Funcao(p) = self.protos[proto].consts[k as usize] else { panic!("CriaFuncao sem função") };
                         let q = self.quadros[qi];
-                        let this = if fb.flags.seta { Valor(self.interno(q.funcao, F_THIS)) } else { q.this };
+                        let mut this = if fb.flags.seta { Valor(self.interno(q.funcao, F_THIS)) } else { q.this };
+                        if fb.flags.construtor_classe && fb.flags.classe_derivada && !self.celula_this(this) && self.protos[p as usize].codigo().flags.seta {
+                            // Seta no construtor derivado: o `this` (e o `super()`) fica numa célula
+                            // [this, construtor, new.target] dividida com o construtor.
+                            let c = self.nova_lista(3);
+                            self.lista_set(c, 0, this);
+                            self.lista_set(c, 1, q.funcao);
+                            self.lista_set(c, 2, q.new_target);
+                            self.quadros[qi].this = c;
+                            this = c;
+                        }
                         let f = self.closure(p, q.contexto, this, None);
                         if fb.flags.seta || self.protos[p as usize].codigo().flags.seta {
                             // A seta herda a casa (super) de quem a cria.
@@ -1253,9 +1520,13 @@ impl Motor {
                         acc = t!(self.criar_classe(proto, k, reg!(rh), ctx));
                     }
                     Op::DefCampo => {
-                        let (r0, r1) = (u!(), u!());
+                        let (r0, r1, n) = (u!(), u!(), u!());
                         let (classe, kv) = (reg!(r0), reg!(r1));
-                        self.registrar_campo(classe, kv, acc);
+                        self.registrar_campo(classe, kv, acc, n);
+                    }
+                    Op::NomeiaFuncao => {
+                        let (r, n) = (u!(), u!());
+                        t!(self.nomear_funcao(acc, reg!(r), n));
                     }
                     Op::DefineCasa => {
                         let r = u!();
@@ -1267,26 +1538,49 @@ impl Motor {
 
                     // ---- operadores ----
                     Op::Soma => {
-                        let (r, _c) = (u!(), u!());
-                        let a = reg!(r);
-                        acc = match (a.e_int() && acc.e_int()).then(|| a.como_int().checked_add(acc.como_int())).flatten().and_then(|s| Valor::int_se_cabe(i64::from(s))) {
-                            Some(v) => v,
-                            None => t!(self.somar(a, acc)),
+                        let (r, c) = (u!(), u!());
+                        let (a, b) = (reg!(r), acc);
+                        acc = match (a.e_int() && b.e_int()).then(|| a.como_int().checked_add(b.como_int())).flatten().and_then(|s| Valor::int_se_cabe(i64::from(s))) {
+                            Some(v) => {
+                                // Inteiro pequeno já é int32: o `| 0` seguinte não faz nada.
+                                if codigo.get(pc) == Some(&(Op::ParaInt32 as u8)) {
+                                    pc += 2;
+                                }
+                                v
+                            }
+                            None => {
+                                // `(a + b) | 0` com int32: a soma de dois int32 é exata no f64, então
+                                // o ToInt32 dela é a soma com volta. Pula o ParaInt32 seguinte e não
+                                // cria o número intermediário.
+                                if codigo.get(pc) == Some(&(Op::ParaInt32 as u8)) {
+                                    if let (Some(x), Some(y)) = (self.int32_de(a), self.int32_de(b)) {
+                                        anotar!(c, a, b, Valor::int(0));
+                                        acc = self.numero(f64::from(x.wrapping_add(y)));
+                                        pc += 2;
+                                        continue 'exec;
+                                    }
+                                }
+                                let v = t!(self.somar(a, b));
+                                anotar!(c, a, b, v);
+                                v
+                            }
                         };
                     }
                     Op::Sub | Op::Mul | Op::Div | Op::Resto | Op::Potencia => {
-                        let (r, _c) = (u!(), u!());
-                        let a = match op {
+                        let (r, c) = (u!(), u!());
+                        let ar = match op {
                             Op::Sub => Arit::Sub,
                             Op::Mul => Arit::Mul,
                             Op::Div => Arit::Div,
                             Op::Resto => Arit::Resto,
                             _ => Arit::Potencia,
                         };
-                        acc = t!(self.aritmetica(a, reg!(r), acc));
+                        let (a, b) = (reg!(r), acc);
+                        acc = t!(self.aritmetica(ar, a, b));
+                        anotar!(c, a, b, acc);
                     }
                     Op::E | Op::Ou | Op::OuExclusivo | Op::DeslEsq | Op::DeslDir | Op::DeslDirSemSinal => {
-                        let (r, _c) = (u!(), u!());
+                        let (r, c) = (u!(), u!());
                         let b = match op {
                             Op::E => Bits::E,
                             Op::Ou => Bits::Ou,
@@ -1295,10 +1589,13 @@ impl Motor {
                             Op::DeslDir => Bits::Dir,
                             _ => Bits::DirSemSinal,
                         };
-                        acc = t!(self.bits(b, reg!(r), acc));
+                        let (x, y) = (reg!(r), acc);
+                        acc = t!(self.bits(b, x, y));
+                        anotar!(c, x, y, acc);
                     }
                     Op::Igual | Op::Diferente => {
-                        let (r, _c) = (u!(), u!());
+                        let (r, c) = (u!(), u!());
+                        anotar!(c, reg!(r), acc, Valor::int(0));
                         let i = t!(self.iguais(reg!(r), acc));
                         acc = Valor::bool(i == (op == Op::Igual));
                     }
@@ -1308,11 +1605,11 @@ impl Motor {
                         acc = Valor::bool(i == (op == Op::Identico));
                     }
                     Op::Menor | Op::Maior | Op::MenorIgual | Op::MaiorIgual => {
-                        let (r, _c) = (u!(), u!());
+                        let (r, c) = (u!(), u!());
                         let (a, b) = (reg!(r), acc);
                         if a.e_int() && b.e_int() {
                             let (x, y) = (a.como_int(), b.como_int());
-                            acc = Valor::bool(match op {
+                            comparou!(match op {
                                 Op::Menor => x < y,
                                 Op::Maior => x > y,
                                 Op::MenorIgual => x <= y,
@@ -1320,6 +1617,7 @@ impl Motor {
                             });
                             continue 'exec;
                         }
+                        anotar!(c, a, b, Valor::int(0));
                         acc = Valor::bool(match op {
                             Op::Menor => t!(self.menor(a, b, true)) == Some(true),
                             Op::Maior => t!(self.menor(b, a, false)) == Some(true),
@@ -1341,12 +1639,18 @@ impl Motor {
                     }
                     Op::SomaInt => {
                         let i = i4!();
-                        let _c = u!();
-                        acc = t!(self.somar_int(acc, i));
+                        let c = u!();
+                        let a = acc;
+                        acc = t!(self.somar_int(a, i));
+                        if !(a.e_int() && acc.e_int()) {
+                            anotar!(c, a, a, acc);
+                        }
                     }
                     Op::Negativo => {
-                        let _c = u!();
-                        acc = t!(self.negativo(acc));
+                        let c = u!();
+                        let a = acc;
+                        acc = t!(self.negativo(a));
+                        anotar!(c, a, a, acc);
                     }
                     Op::ParaNumero => {
                         if !acc.e_int() {
@@ -1360,20 +1664,52 @@ impl Motor {
                     }
                     Op::Nao => acc = Valor::bool(!self.verdadeiro(acc)),
                     Op::Til => {
-                        let _c = u!();
-                        acc = t!(self.til(acc));
+                        let c = u!();
+                        let a = acc;
+                        acc = t!(self.til(a));
+                        anotar!(c, a, a, acc);
                     }
                     Op::Typeof => acc = self.typeof_(acc),
                     Op::Incrementa | Op::Decrementa => {
-                        let _c = u!();
-                        let d = if op == Op::Incrementa { 1 } else { -1 };
-                        acc = if self.e_bigint(acc) {
-                            let x = self.ler_bigint(acc).somar(&crate::grande::Grande::de_i64(d));
-                            self.novo_bigint(&x)
-                        } else {
-                            let n = if acc.e_int() { acc } else { t!(self.para_numero_valor(acc)) };
-                            t!(self.somar_int(n, d as i32))
-                        };
+                        let c = u!();
+                        let a = acc;
+                        acc = t!(self.mais_um(a, op == Op::Incrementa));
+                        if !(a.e_int() && acc.e_int()) {
+                            anotar!(c, a, a, acc);
+                        }
+                    }
+                    Op::IncrementaReg | Op::DecrementaReg => {
+                        let (r, c) = (u!(), u!());
+                        let a = reg!(r);
+                        if a.e_int() {
+                            let n = a.como_int() + if op == Op::IncrementaReg { 1 } else { -1 };
+                            if let Some(n) = Valor::int_se_cabe(i64::from(n)) {
+                                reg!(r) = n;
+                                // `i++` no fim do laço: o salto para trás vem logo depois.
+                                if codigo.get(pc) == Some(&(Op::SaltaAtras as u8)) {
+                                    pc = i32::from_le_bytes(codigo[pc + 1..pc + 5].try_into().unwrap()) as u32 as usize;
+                                    volta!();
+                                }
+                                continue 'exec;
+                            }
+                        }
+                        let v = if a.e_int() { a } else { t!(self.para_numerico(a)) };
+                        let n = t!(self.mais_um(v, op == Op::IncrementaReg));
+                        reg!(r) = n;
+                        if !(a.e_int() && n.e_int()) {
+                            anotar!(c, a, a, n);
+                        }
+                    }
+                    Op::ParaInt32 => {
+                        let c = u!();
+                        if !acc.e_int() && self.e_numero(acc) {
+                            let x = crate::numeros::para_int32(self.f64_de(acc));
+                            acc = self.numero(f64::from(x));
+                        } else if !acc.e_int() {
+                            let a = acc;
+                            acc = t!(self.bits(Bits::Ou, a, Valor::int(0)));
+                            anotar!(c, a, a, acc);
+                        }
                     }
                     Op::ParaTexto => acc = t!(self.para_texto(acc)),
                     Op::ParaChave => {
@@ -1388,17 +1724,7 @@ impl Motor {
                     Op::Salta => pc = i4!() as u32 as usize,
                     Op::SaltaAtras => {
                         pc = i4!() as u32 as usize;
-                        self.voltas = self.voltas.wrapping_add(1);
-                        if self.voltas & 0xFFFF == 0 {
-                            if let Some(motivo) = self.interromper.as_mut().and_then(|f| f()) {
-                                let e = self.erro(crate::intrinsecos::TipoErro::Erro, &motivo);
-                                t!(Err::<Valor, Valor>(e));
-                            }
-                        }
-                        if self.g.coleta_pendente && self.aninhamento == 0 {
-                            salvar_pc!();
-                            acc = self.ponto_seguro(acc);
-                        }
+                        volta!();
                     }
                     Op::SaltaSeVerdadeiro | Op::SaltaSeFalso => {
                         let a = i4!() as u32 as usize;
@@ -1472,21 +1798,36 @@ impl Motor {
                         } else {
                             t!(self.coletar_iteravel(reg!(ra)))
                         };
-                        acc = t!(self.super_chamar(qi, &args));
+                        acc = t!(self.super_chamar(qi, &args, fb.flags.seta));
                     }
                     Op::Retorna => {
                         let q = self.quadros[qi];
                         let mut v = acc;
+                        // Os erros do [[Construct]] vêm depois do corpo: o try/catch dele não os pega.
+                        let mut erro = None;
                         if q.construindo && !self.e_objeto(v) {
                             if v != Valor::UNDEFINED && fb.flags.classe_derivada {
-                                t!(self.erro_tipo::<()>("Derived constructors may only return object or undefined"));
+                                erro = self.erro_tipo::<()>("Derived constructors may only return object or undefined").err();
                             }
                             v = q.this;
-                            if v == Valor::BURACO {
-                                t!(self.erro_referencia::<()>("Must call super constructor in derived class before accessing 'this' or returning from derived constructor"));
+                            if self.celula_this(v) {
+                                v = self.lista_get(v, 0);
+                            }
+                            if v == Valor::BURACO && erro.is_none() {
+                                erro = self.erro_referencia::<()>("Must call super constructor in derived class before accessing 'this' or returning from derived constructor").err();
                             }
                         }
                         self.quadros.pop();
+                        if let Some(e) = erro {
+                            if q.entrada {
+                                self.pilha.truncate(q.topo as usize);
+                                return Err(e);
+                            }
+                            let fim = self.quadros.last().unwrap().fim;
+                            self.pilha.truncate(fim as usize);
+                            pendente = Some((e, false));
+                            continue 'quadro;
+                        }
                         if q.entrada {
                             self.pilha.truncate(q.topo as usize);
                             return Ok(Fim::Retorno(v));
@@ -1515,11 +1856,63 @@ impl Motor {
 
                     // ---- iteração ----
                     Op::ObtemIterador => {
-                        let (r, _n) = (u!(), u!());
-                        // shortcut: `for await` e `yield*` assíncrono usam o iterador comum.
-                        let reg_it = t!(self.obter_iterador(acc));
+                        // n: bit 0 = assíncrono; bit 1 = iterador de verdade (sem o atalho de array).
+                        let (r, n) = (u!(), u!());
+                        let reg_it = if n & 1 != 0 {
+                            t!(self.obter_iterador_async(acc))
+                        } else if n & 2 != 0 {
+                            t!(self.obter_iterador_real(acc))
+                        } else {
+                            t!(self.obter_iterador(acc))
+                        };
                         reg!(r) = reg_it;
                         acc = Valor::UNDEFINED;
+                    }
+                    Op::ChamaProximo => {
+                        let r = u!();
+                        let reg = reg!(r);
+                        salvar_pc!();
+                        // Fica "acabado" até o resultado chegar: erro no next/await não fecha o iterador.
+                        self.lista_set(reg, 2, Valor::TRUE);
+                        let (it, next) = (self.lista_get(reg, 0), self.lista_get(reg, 1));
+                        acc = t!(self.chamar(next, it, &[]));
+                    }
+                    Op::ResultadoProximo => {
+                        let r = u!();
+                        let a = i4!() as u32 as usize;
+                        let reg = reg!(r);
+                        salvar_pc!();
+                        if !self.e_objeto(acc) {
+                            t!(self.erro_tipo::<()>("Iterator result is not an object"));
+                        }
+                        let feito = t!(self.obter(acc, ChaveProp::Nome(fixos::DONE)));
+                        if self.verdadeiro(feito) {
+                            pc = a;
+                        } else {
+                            acc = t!(self.obter(acc, ChaveProp::Nome(fixos::VALUE)));
+                            self.lista_set(reg, 2, Valor::FALSE);
+                        }
+                    }
+                    Op::FechaIteradorAsync => {
+                        let r = u!();
+                        let a = i4!() as u32 as usize;
+                        let reg = reg!(r);
+                        salvar_pc!();
+                        if self.lista_get(reg, 2) == Valor::TRUE {
+                            pc = a;
+                        } else {
+                            self.lista_set(reg, 2, Valor::TRUE);
+                            let it = self.lista_get(reg, 0);
+                            match t!(self.obter_metodo(it, ChaveProp::Nome(fixos::RETURN))) {
+                                Some(f) => acc = t!(self.chamar(f, it, &[])),
+                                None => pc = a,
+                            }
+                        }
+                    }
+                    Op::ExigeObjeto => {
+                        if !self.e_objeto(acc) {
+                            t!(self.erro_tipo::<()>("Iterator result is not an object"));
+                        }
                     }
                     Op::Proximo => {
                         let r = u!();
@@ -1536,6 +1929,18 @@ impl Motor {
                         let it = reg!(r);
                         salvar_pc!();
                         t!(self.fechar_iterador(it));
+                    }
+                    Op::FechaIteradorEmErro => {
+                        let r = u!();
+                        let it = reg!(r);
+                        salvar_pc!();
+                        // IteratorClose com completude de exceção (§7.4.11 passo 5): o erro do
+                        // `return` não substitui o que já estava sendo lançado. Fim do script não.
+                        if let Err(e) = self.fechar_iterador(it) {
+                            if self.terminando {
+                                t!(Err::<(), _>(e));
+                            }
+                        }
                     }
                     Op::PreparaForIn => {
                         let r = u!();
@@ -1568,17 +1973,33 @@ impl Motor {
 
                     // ---- geradores e async ----
                     Op::IniciaGerador => {
+                        let assinc = fb.flags.assincrona;
                         let f = self.quadros[qi].funcao;
                         let p = t!(self.obter(f, ChaveProp::Nome(fixos::PROTOTYPE)));
-                        let p = if self.e_objeto(p) { p } else { self.intr.gerador_proto };
+                        let p = if self.e_objeto(p) {
+                            p
+                        } else if assinc {
+                            self.intr.async_gerador_proto
+                        } else {
+                            self.intr.gerador_proto
+                        };
                         let forma = self.forma_para(Classe::Gerador, p, 0);
                         let gen = self.novo_objeto(forma);
                         let id = self.novo_suspenso();
                         self.por_interno(gen, 0, id);
                         self.por_interno_valor(gen, 2, f);
+                        if assinc {
+                            // Gerador async: a fila de pedidos (e o estado) no campo 1.
+                            let fila = self.nova_lista(1);
+                            self.lista_set(fila, 0, Valor::int(crate::builtins::assincronos::AG_INICIO));
+                            self.por_interno_valor(gen, 1, fila);
+                        }
                         let entrada = self.quadros[qi].entrada;
                         self.quadros[qi].suspenso = id;
-                        let salvo = self.salvar_quadro(pc as u32);
+                        let mut salvo = self.salvar_quadro(pc as u32);
+                        if assinc {
+                            salvo.promessa = gen;
+                        }
                         self.suspensos[id as usize] = Some(salvo);
                         if entrada {
                             return Ok(Fim::Retorno(gen));
@@ -1591,7 +2012,8 @@ impl Motor {
                     Op::Suspende | Op::Aguarda => {
                         let id = self.quadros[qi].suspenso;
                         assert!(self.quadros[qi].entrada && id != SEM_SUSPENSO, "yield/await fora de gerador ou async");
-                        let salvo = self.salvar_quadro(pc as u32);
+                        let mut salvo = self.salvar_quadro(pc as u32);
+                        salvo.modo = if matches!(op, Op::Aguarda) { AGUARDA } else { RENDEU };
                         self.suspensos[id as usize] = Some(salvo);
                         return Ok(Fim::Suspenso(acc));
                     }
@@ -1600,25 +2022,35 @@ impl Motor {
                         acc = self.resultado_iterador(acc, n == 1);
                     }
                     Op::ModoRetomada => {
-                        let _ = u!();
+                        let a = i4!() as u32 as usize;
+                        if std::mem::replace(&mut retomada, RETOMOU_NORMAL) == RETOMOU_RETORNA {
+                            pc = a;
+                        }
                     }
                     Op::Delega => {
                         let r = u!();
-                        let a = i4!() as u32 as usize;
-                        let it = reg!(r);
+                        let a_fim = i4!() as u32 as usize;
+                        let a_ret = i4!() as u32 as usize;
+                        let reg = reg!(r);
+                        let modo = std::mem::replace(&mut retomada, RETOMOU_NORMAL);
                         salvar_pc!();
-                        // shortcut: throw/return no gerador de fora não repassam ao de dentro.
-                        let res = t!(self.passo_iterador(it, acc));
-                        let feito = t!(self.obter(res, ChaveProp::Nome(fixos::DONE)));
-                        let v = t!(self.obter(res, ChaveProp::Nome(fixos::VALUE)));
-                        if self.verdadeiro(feito) {
-                            acc = v;
-                            pc = a;
-                        } else {
-                            let id = self.quadros[qi].suspenso;
-                            let salvo = self.salvar_quadro(ini as u32);
-                            self.suspensos[id as usize] = Some(salvo);
-                            return Ok(Fim::Suspenso(v));
+                        match t!(self.delegar(reg, modo, acc, fb.flags.assincrona)) {
+                            Passo::Fim(v) => {
+                                acc = v;
+                                pc = a_fim;
+                            }
+                            Passo::Retorno(v) => {
+                                acc = v;
+                                pc = a_ret;
+                            }
+                            Passo::Para(v, modo) => {
+                                // Volta para o próprio Delega ao retomar.
+                                let id = self.quadros[qi].suspenso;
+                                let mut salvo = self.salvar_quadro(ini as u32);
+                                salvo.modo = modo;
+                                self.suspensos[id as usize] = Some(salvo);
+                                return Ok(Fim::Suspenso(v));
+                            }
                         }
                     }
 
@@ -1660,16 +2092,100 @@ impl Motor {
         })
     }
 
-    fn chave_privada(&mut self, c: Chave) -> Chave {
-        if let Some(&k) = self.privados.get(&c.0) {
-            return k;
+    /// SetFunctionName(f, chave, prefixo): n 0 sem prefixo, 1 `get `, 2 `set `. Símbolo vira
+    /// `[descrição]`; nome privado (símbolo escondido), a própria descrição `#x`.
+    fn nomear_funcao(&mut self, f: Valor, k: Valor, n: u32) -> Res<()> {
+        if !self.e_funcao(f) || self.formas.get(self.forma(f)).classe != Classe::Funcao {
+            return Ok(());
         }
-        let d = self.texto_do_nome(c);
-        let s = self.novo_simbolo(d);
-        let k = self.chave_do_simbolo(s);
-        self.escondidos.insert(k.0 & !Chave::BIT_SIMBOLO);
-        self.privados.insert(c.0, k);
-        k
+        let mut u: Vec<u16> = ["", "get ", "set "][n as usize].encode_utf16().collect();
+        if self.e_simbolo(k) {
+            let d = self.descricao_do_simbolo(k);
+            if self.escondidos.contains(&(self.chave_do_simbolo(k).0 & !Chave::BIT_SIMBOLO)) {
+                u.extend(self.texto_u16_de(d));
+            } else if d != Valor::UNDEFINED {
+                u.push(b'[' as u16);
+                u.extend(self.texto_u16_de(d));
+                u.push(b']' as u16);
+            }
+        } else {
+            let t = self.para_texto(k)?;
+            u.extend(self.texto_u16_de(t));
+        }
+        let nome = self.texto_u16(&u);
+        self.gravar_campo(f, 1, nome);
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------- elementos privados
+
+    /// Os elementos privados moram no próprio objeto, sob o símbolo escondido do nome: a busca
+    /// é só ali (sem protótipo, sem armadilha de Proxy). Campo = dado enumerável (assim
+    /// `freeze`, que só tira gravável/configurável, não o confunde com método); método = dado
+    /// não enumerável; getter/setter = par de acessores.
+    fn privado(&self, o: Valor, nome: Valor) -> Option<crate::formas::Descritor> {
+        if !self.e_objeto(o) {
+            return None;
+        }
+        self.propria(o, self.chave_do_simbolo(nome))
+    }
+
+    fn sem_privado<T>(&mut self, nome: Valor) -> Res<T> {
+        let d = self.descricao_do_simbolo(nome);
+        let t = self.para_texto(d).map(|t| self.texto_rust(t)).unwrap_or_default();
+        self.erro_tipo(&format!("Cannot access private member {t} on an object whose class did not declare it"))
+    }
+
+    /// PrivateGet.
+    fn ler_privado(&mut self, o: Valor, nome: Valor) -> Res<Valor> {
+        let Some(d) = self.privado(o, nome) else { return self.sem_privado(nome) };
+        let v = self.ler_campo(o, d.slot);
+        if d.attrs & attr::ACESSOR == 0 {
+            return Ok(v);
+        }
+        let g = self.acessor_get(v);
+        if g == Valor::UNDEFINED {
+            return self.erro_tipo("'#' accessor was defined without a getter");
+        }
+        self.chamar(g, o, &[])
+    }
+
+    /// PrivateSet.
+    fn gravar_privado(&mut self, o: Valor, nome: Valor, x: Valor) -> Res<()> {
+        let Some(d) = self.privado(o, nome) else { return self.sem_privado(nome) };
+        if d.attrs & attr::ACESSOR != 0 {
+            let s = self.acessor_set(self.ler_campo(o, d.slot));
+            if s == Valor::UNDEFINED {
+                return self.erro_tipo("'#' accessor was defined without a setter");
+            }
+            return self.chamar(s, o, &[x]).map(|_| ());
+        }
+        if d.attrs & attr::ENUMERAVEL == 0 {
+            return self.erro_tipo("Private method is not writable");
+        }
+        self.gravar_campo(o, d.slot, x);
+        Ok(())
+    }
+
+    /// PrivateFieldAdd (`n` = 0) e PrivateMethodOrAccessorAdd (1 método, 2 getter, 3 setter).
+    fn acrescentar_privado(&mut self, o: Valor, nome: Valor, v: Valor, n: u32) -> Res<()> {
+        let c = self.chave_do_simbolo(nome);
+        let atual = self.propria(o, c);
+        if n >= 2 {
+            // Getter e setter do mesmo nome chegam um depois do outro: o segundo completa o par.
+            let par = atual.filter(|d| d.attrs & attr::ACESSOR != 0).map(|d| self.ler_campo(o, d.slot));
+            let (mut g, mut s) = par.map_or((Valor::UNDEFINED, Valor::UNDEFINED), |p| (self.acessor_get(p), self.acessor_set(p)));
+            if n == 2 { g = v } else { s = v }
+            let par = self.novo_acessor(g, s);
+            self.definir_propria(o, c, par, attr::ACESSOR);
+            return Ok(());
+        }
+        if atual.is_some() {
+            return self.erro_tipo("Cannot initialize private member twice on the same object");
+        }
+        let a = if n == 0 { attr::GRAVAVEL | attr::ENUMERAVEL } else { 0 };
+        self.definir_propria(o, c, v, a);
+        Ok(())
     }
 
     /// Protótipo da casa do método atual (`super`).
@@ -1682,20 +2198,34 @@ impl Motor {
         Ok(self.proto_de(casa))
     }
 
-    fn super_chamar(&mut self, qi: usize, args: &[Valor]) -> Res<Valor> {
+    /// Célula do `this` de construtor derivado com setas (ver `CriaFuncao`).
+    #[inline]
+    fn celula_this(&self, v: Valor) -> bool {
+        v.e_ref() && self.forma(v) == crate::formas::LISTA
+    }
+
+    fn super_chamar(&mut self, qi: usize, args: &[Valor], seta: bool) -> Res<Valor> {
         let q = self.quadros[qi];
-        // Em seta dentro do construtor, a classe é a da casa (shortcut: só o quadro direto).
-        let f = q.funcao;
+        // Em seta, o construtor, o new.target e o this vêm da célula dividida com ele.
+        let c = if seta { Valor(self.interno(q.funcao, F_THIS)) } else { q.this };
+        let celula = self.celula_this(c);
+        let (f, nt0) = if celula { (self.lista_get(c, 1), self.lista_get(c, 2)) } else { (q.funcao, q.new_target) };
         let pai = self.proto_de(f);
         if !self.e_construtor(pai) {
             return self.erro_tipo("Super constructor is not a constructor");
         }
-        if q.this != Valor::BURACO {
+        let nt = if nt0 == Valor::UNDEFINED { f } else { nt0 };
+        let o = self.construir(pai, args, nt)?;
+        // BindThisValue depois de construir (a classe base roda mesmo no segundo `super()`).
+        let ja = if celula { self.lista_get(c, 0) } else { self.quadros[qi].this };
+        if ja != Valor::BURACO {
             return self.erro_referencia("Super constructor may only be called once");
         }
-        let nt = if q.new_target == Valor::UNDEFINED { f } else { q.new_target };
-        let o = self.construir(pai, args, nt)?;
-        self.quadros[qi].this = o;
+        if celula {
+            self.lista_set(c, 0, o);
+        } else {
+            self.quadros[qi].this = o;
+        }
         self.rodar_campos(f, o)?;
         Ok(o)
     }
@@ -1739,15 +2269,16 @@ impl Motor {
         Ok(f)
     }
 
-    fn registrar_campo(&mut self, classe: Valor, k: Valor, init: Valor) {
+    fn registrar_campo(&mut self, classe: Valor, k: Valor, valor: Valor, tipo: u32) {
         let lista = match self.propria(classe, simb::CAMPOS) {
             Some(d) => self.ler_campo(classe, d.slot),
             None => Valor::LISTA_VAZIA,
         };
         let n = if lista == Valor::LISTA_VAZIA { 0 } else { self.lista_len(lista) };
-        let nova = self.redimensionar_lista(lista, n + 2, Valor::UNDEFINED);
+        let nova = self.redimensionar_lista(lista, n + 3, Valor::UNDEFINED);
         self.lista_set(nova, n, k);
-        self.lista_set(nova, n + 1, init);
+        self.lista_set(nova, n + 1, valor);
+        self.lista_set(nova, n + 2, Valor::int(tipo as i32));
         self.definir_propria(classe, simb::CAMPOS, nova, 0);
     }
 
@@ -1799,9 +2330,24 @@ impl Motor {
     pub fn array_de(&mut self, itens: &[Valor]) -> Valor {
         let f = self.intr.forma_array;
         let a = self.novo_objeto(f);
-        for (i, &v) in itens.iter().enumerate() {
-            self.gravar_elemento(a, i as u32, v);
+        if itens.is_empty() {
+            return a;
         }
+        // A lista nasce do tamanho certo e o tipo dos elementos é decidido uma vez só (o mesmo que
+        // `gravar_elemento` item a item daria: inteiros, ou valores).
+        debug_assert!(!itens.contains(&Valor::BURACO));
+        let n = itens.len() as u32;
+        let el = self.nova_lista(n);
+        for (i, &v) in itens.iter().enumerate() {
+            self.lista_set(el, i as u32, v);
+        }
+        let d = a.deslocamento();
+        self.g.por_valor(d, d + 8, el);
+        if !itens.iter().all(|v| v.e_int()) {
+            let nf = self.formas.com_elementos(f, crate::formas::TipoElementos::Valores);
+            self.g.por_u32(d, nf.0);
+        }
+        self.por_interno(a, 0, n);
         a
     }
 
@@ -1854,6 +2400,54 @@ impl Motor {
     }
 
     /// Ponto seguro: aqui o coletor pode rodar (o acc está fora da pilha, então vai junto).
+    /// Passou do [`crate::gaiola::TETO`]: coleta tudo (se pode) e diz se ainda não cabe.
+    #[inline]
+    fn sem_memoria(&mut self, acc: &mut Valor) -> bool {
+        if self.g.cabe(0) || self.terminando {
+            return false;
+        }
+        if self.pode_coletar() {
+            let mut a = [*acc];
+            self.coletar_tudo(&mut a);
+            *acc = a[0];
+        }
+        !self.g.cabe(0)
+    }
+
+    fn sem_memoria_erro(&mut self) -> Res<Valor> {
+        self.terminando = true;
+        self.erro_alcance("Out of memory")
+    }
+
+    /// O bit de [`tipo`] de um valor.
+    #[inline]
+    fn perfil(&self, v: Valor) -> u8 {
+        use crate::formas::{BIGINT, CORDA, LATIN1, NUMERO, UTF16};
+        if v.e_int() {
+            return tipo::INT;
+        }
+        match self.forma(v) {
+            NUMERO => tipo::DOUBLE,
+            LATIN1 | UTF16 | CORDA => tipo::TEXTO,
+            BIGINT => tipo::BIGINT,
+            _ => tipo::OUTRO,
+        }
+    }
+
+    /// Anota no cache `c` os operandos `a` e `b` e se a conta saiu dos inteiros (`r`). Fora de
+    /// linha: dentro do `laco` gigante ela piorava os registradores do caminho rápido (+12%).
+    #[cold]
+    #[inline(never)]
+    fn anotar(&mut self, proto: usize, c: u32, a: Valor, b: Valor, r: Valor) {
+        let mut t = self.perfil(a) | self.perfil(b);
+        if a.e_int() && b.e_int() && !r.e_int() {
+            t |= tipo::ESTOUROU;
+        }
+        let e = &mut self.protos[proto].tipos[c as usize];
+        // Os 2 bits de cima contam anotações seguidas sem novidade; na 3ª o cache fica estável.
+        *e = if *e & t == t { *e + tipo::UMA_SEM_NOVIDADE } else { (*e | t) & !tipo::ESTAVEL };
+    }
+
     fn ponto_seguro(&mut self, acc: Valor) -> Valor {
         let mut a = [acc];
         self.coletar(&mut a);
@@ -1870,15 +2464,22 @@ impl Motor {
         o
     }
 
-    /// Registro de iterador: lista `[iterador, next, feito]`; array comum: `[array, IT_ARRAY, i]`.
+    /// Registro de iterador: lista `[iterador, next, feito, fase do yield*]`; array comum:
+    /// `[array, IT_ARRAY, i]`.
     pub fn obter_iterador(&mut self, v: Valor) -> Res<Valor> {
-        let reg = self.nova_lista(3);
         if self.e_array(v) && self.iterador_de_array_intacto(v) {
+            let reg = self.nova_lista(3);
             self.lista_set(reg, 0, v);
             self.lista_set(reg, 1, IT_ARRAY);
             self.lista_set(reg, 2, Valor::int(0));
             return Ok(reg);
         }
+        self.obter_iterador_real(v)
+    }
+
+    /// GetIterator(v, sync) sem o atalho de array (o `yield*` fala com o iterador de verdade).
+    pub fn obter_iterador_real(&mut self, v: Valor) -> Res<Valor> {
+        let reg = self.nova_lista(4);
         let f = self.obter(v, ChaveProp::Nome(simb::ITERATOR))?;
         if !self.e_funcao(f) {
             let d = self.descrever(v);
@@ -1892,7 +2493,151 @@ impl Motor {
         self.lista_set(reg, 0, it);
         self.lista_set(reg, 1, next);
         self.lista_set(reg, 2, Valor::FALSE);
+        self.lista_set(reg, 3, Valor::int(0));
         Ok(reg)
+    }
+
+    /// GetIterator(v, async): `[Symbol.asyncIterator]`, ou o iterador comum embrulhado
+    /// (CreateAsyncFromSyncIterator).
+    pub fn obter_iterador_async(&mut self, v: Valor) -> Res<Valor> {
+        let (it, next) = match self.obter_metodo(v, ChaveProp::Nome(simb::ASYNC_ITERATOR))? {
+            Some(f) => {
+                let it = self.chamar(f, v, &[])?;
+                if !self.e_objeto(it) {
+                    return self.erro_tipo("Result of the Symbol.asyncIterator method is not an object");
+                }
+                let next = self.obter(it, ChaveProp::Nome(fixos::NEXT))?;
+                (it, next)
+            }
+            None => {
+                let sync = self.obter_iterador_real(v)?;
+                let w = self.async_de_sync(sync);
+                let next = self.obter(w, ChaveProp::Nome(fixos::NEXT))?;
+                (w, next)
+            }
+        };
+        let reg = self.nova_lista(4);
+        self.lista_set(reg, 0, it);
+        self.lista_set(reg, 1, next);
+        self.lista_set(reg, 2, Valor::FALSE);
+        self.lista_set(reg, 3, Valor::int(0));
+        Ok(reg)
+    }
+
+    /// Um passo do `yield*` sobre o registro `reg` (§15.5.5, YieldExpression: yield* ...),
+    /// retomado com `modo` e o valor `v`. Em gerador async cada resultado do de dentro é
+    /// aguardado: o passo para (AGUARDA) e a fase fica no item 3 do registro.
+    fn delegar(&mut self, reg: Valor, modo: u8, v: Valor, assinc: bool) -> Res<Passo> {
+        const RESULTADO: i32 = 1;
+        const RESULTADO_DO_RETURN: i32 = 2;
+        const VALOR_DO_RETURN: i32 = 3;
+        const FECHOU_SEM_THROW: i32 = 4;
+        let it = self.lista_get(reg, 0);
+        let fase = self.lista_get(reg, 3);
+        let fase = if fase.e_int() { fase.como_int() } else { 0 };
+        self.lista_set(reg, 3, Valor::int(0));
+        if fase != 0 && modo == RETOMOU_LANCA {
+            // A espera foi rejeitada: o erro sobe no gerador de fora.
+            return Err(v);
+        }
+        let aguardar = |m: &mut Motor, fase: i32, x: Valor| {
+            m.lista_set(reg, 3, Valor::int(fase));
+            Ok(Passo::Para(x, AGUARDA))
+        };
+        match fase {
+            RESULTADO => return self.delegar_resultado(v, false, assinc),
+            RESULTADO_DO_RETURN => return self.delegar_resultado(v, true, assinc),
+            VALOR_DO_RETURN => return self.delegar_retorno(reg, v, assinc),
+            FECHOU_SEM_THROW => {
+                if !self.e_objeto(v) {
+                    return self.erro_tipo("Iterator result is not an object");
+                }
+                return self.erro_tipo("The iterator does not provide a 'throw' method");
+            }
+            _ => {}
+        }
+        match modo {
+            RETOMOU_NORMAL => {
+                let next = self.lista_get(reg, 1);
+                let r = self.chamar(next, it, &[v])?;
+                if assinc {
+                    return aguardar(self, RESULTADO, r);
+                }
+                self.delegar_resultado(r, false, assinc)
+            }
+            RETOMOU_LANCA => match self.obter_metodo(it, ChaveProp::Nome(fixos::THROW))? {
+                Some(f) => {
+                    let r = self.chamar(f, it, &[v])?;
+                    if assinc {
+                        return aguardar(self, RESULTADO, r);
+                    }
+                    self.delegar_resultado(r, false, assinc)
+                }
+                None => {
+                    // Sem `throw` o de dentro não recebe o erro: fecha ele e lança TypeError.
+                    if let Some(f) = self.obter_metodo(it, ChaveProp::Nome(fixos::RETURN))? {
+                        let r = self.chamar(f, it, &[])?;
+                        if assinc {
+                            return aguardar(self, FECHOU_SEM_THROW, r);
+                        }
+                        if !self.e_objeto(r) {
+                            return self.erro_tipo("Iterator result is not an object");
+                        }
+                    }
+                    self.erro_tipo("The iterator does not provide a 'throw' method")
+                }
+            },
+            _ => {
+                // Em async, o valor do return é aguardado antes (AsyncGeneratorUnwrapYieldResumption).
+                if assinc {
+                    return aguardar(self, VALOR_DO_RETURN, v);
+                }
+                self.delegar_retorno(reg, v, assinc)
+            }
+        }
+    }
+
+    fn delegar_retorno(&mut self, reg: Valor, v: Valor, assinc: bool) -> Res<Passo> {
+        let it = self.lista_get(reg, 0);
+        match self.obter_metodo(it, ChaveProp::Nome(fixos::RETURN))? {
+            None => Ok(Passo::Retorno(v)),
+            Some(f) => {
+                let r = self.chamar(f, it, &[v])?;
+                if assinc {
+                    self.lista_set(reg, 3, Valor::int(2));
+                    return Ok(Passo::Para(r, AGUARDA));
+                }
+                self.delegar_resultado(r, true, assinc)
+            }
+        }
+    }
+
+    fn delegar_resultado(&mut self, r: Valor, de_retorno: bool, assinc: bool) -> Res<Passo> {
+        if !self.e_objeto(r) {
+            return self.erro_tipo("Iterator result is not an object");
+        }
+        let feito = self.obter(r, ChaveProp::Nome(fixos::DONE))?;
+        if self.verdadeiro(feito) {
+            let v = self.obter(r, ChaveProp::Nome(fixos::VALUE))?;
+            return Ok(if de_retorno { Passo::Retorno(v) } else { Passo::Fim(v) });
+        }
+        if assinc {
+            let v = self.obter(r, ChaveProp::Nome(fixos::VALUE))?;
+            return Ok(Passo::Para(v, RENDEU));
+        }
+        Ok(Passo::Para(r, RENDEU_CRU))
+    }
+
+    /// A instrução onde o quadro do topo parou é uma destas?
+    fn parado_em(&self, ops: &[Op]) -> bool {
+        let Some(q) = self.quadros.last() else { return false };
+        let p = &self.protos[q.proto as usize];
+        let codigo = &p.codigo().codigo;
+        let mut i = q.pc as usize;
+        if matches!(codigo.get(i).copied(), Some(b) if b == Op::Largo as u8 || b == Op::Largo4 as u8) {
+            i += 1;
+        }
+        codigo.get(i).and_then(|&b| Op::de_byte(b)).is_some_and(|op| ops.contains(&op))
     }
 
     fn iterador_de_array_intacto(&mut self, a: Valor) -> bool {
@@ -1948,23 +2693,6 @@ impl Motor {
         self.obter(r, ChaveProp::Nome(fixos::VALUE)).map(Some)
     }
 
-    /// `next(v)` cru (para `yield*`).
-    fn passo_iterador(&mut self, reg: Valor, v: Valor) -> Res<Valor> {
-        let it = self.lista_get(reg, 0);
-        if self.lista_get(reg, 1) == IT_ARRAY {
-            return match self.proximo(reg)? {
-                Some(x) => Ok(self.resultado_iterador(x, false)),
-                None => Ok(self.resultado_iterador(Valor::UNDEFINED, true)),
-            };
-        }
-        let next = self.lista_get(reg, 1);
-        let r = self.chamar(next, it, &[v])?;
-        if !self.e_objeto(r) {
-            return self.erro_tipo("Iterator result is not an object");
-        }
-        Ok(r)
-    }
-
     pub fn fechar_iterador(&mut self, reg: Valor) -> Res<()> {
         if self.lista_get(reg, 1) == IT_ARRAY || self.lista_get(reg, 2) == Valor::TRUE {
             return Ok(());
@@ -1973,6 +2701,22 @@ impl Motor {
         let it = self.lista_get(reg, 0);
         if let Some(f) = self.obter_metodo(it, ChaveProp::Nome(fixos::RETURN))? {
             self.chamar(f, it, &[])?;
+        }
+        Ok(())
+    }
+
+    /// Chama `f` com cada valor de um iterável (e o índice), um por vez, sem juntar tudo antes:
+    /// um iterador infinito com callback que lança não enche a memória. Se `f` falha, fecha o
+    /// iterador (IteratorClose) e devolve o erro de `f`.
+    pub fn percorrer_iteravel(&mut self, v: Valor, mut f: impl FnMut(&mut Motor, Valor, u64) -> Res<()>) -> Res<()> {
+        let reg = self.obter_iterador(v)?;
+        let mut i = 0;
+        while let Some(x) = self.proximo(reg)? {
+            if let Err(e) = f(self, x, i) {
+                let _ = self.fechar_iterador(reg);
+                return Err(e);
+            }
+            i += 1;
         }
         Ok(())
     }
@@ -2042,11 +2786,61 @@ impl Motor {
 
     // ---------------------------------------------------------------- caches de propriedade
 
+    /// Entrada do cache `ci` para a forma `fo`: a monomórfica, uma das polimórficas ou a da
+    /// tabela megamórfica.
+    #[inline(always)]
+    fn entrada_do_cache(&self, proto: usize, ci: u32, fo: u32, c: Chave) -> Option<CacheProp> {
+        let cache = self.protos[proto].caches[ci as usize];
+        if cache.forma == fo {
+            return Some(cache);
+        }
+        match cache.poli {
+            SEM_POLI => None,
+            MEGA => self.mega.get(&(fo, c)).copied(),
+            i => self.poli[i as usize].iter().find(|e| e.forma == fo).copied(),
+        }
+    }
+
+    /// Guarda `e` no cache `ci`: na entrada monomórfica se está vazia (ou é da mesma forma), nas
+    /// polimórficas até 4 formas, e na tabela megamórfica depois.
+    fn guardar_no_cache(&mut self, proto: usize, ci: u32, c: Chave, e: CacheProp) {
+        let cache = self.protos[proto].caches[ci as usize];
+        if cache.forma == u32::MAX || cache.forma == e.forma {
+            self.protos[proto].caches[ci as usize] = CacheProp { poli: cache.poli, ..e };
+            return;
+        }
+        match cache.poli {
+            SEM_POLI => {
+                let vazio = CacheProp::default();
+                self.protos[proto].caches[ci as usize].poli = self.poli.len() as u32;
+                self.poli.push([e, vazio, vazio]);
+            }
+            MEGA => self.guardar_mega(c, e),
+            i => {
+                let p = &mut self.poli[i as usize];
+                if let Some(s) = p.iter_mut().find(|x| x.forma == u32::MAX || x.forma == e.forma) {
+                    *s = e;
+                } else {
+                    self.protos[proto].caches[ci as usize].poli = MEGA;
+                    self.guardar_mega(c, e);
+                }
+            }
+        }
+    }
+
+    fn guardar_mega(&mut self, c: Chave, e: CacheProp) {
+        // shortcut: a tabela é zerada ao passar de 8192 entradas (formas nunca morrem); trocar
+        // por tabela de tamanho fixo com substituição se algum site real encher.
+        if self.mega.len() >= 8192 {
+            self.mega.clear();
+        }
+        self.mega.insert((e.forma, c), e);
+    }
+
     fn ler_prop_cache(&mut self, proto: usize, ci: u32, o: Valor, c: Chave) -> Res<Valor> {
         if o.e_ref() {
             let fo = self.forma(o).0;
-            let cache = self.protos[proto].caches[ci as usize];
-            if cache.forma == fo {
+            if let Some(cache) = self.entrada_do_cache(proto, ci, fo, c) {
                 if cache.dono == Valor::UNDEFINED {
                     return Ok(self.ler_campo(o, cache.deslocamento));
                 }
@@ -2054,6 +2848,11 @@ impl Motor {
                     return Ok(self.ler_campo(cache.dono, cache.deslocamento));
                 }
             }
+        }
+        // `arr.length` (a condição de quase todo laço) não mora na forma: lê o campo interno.
+        if c == fixos::LENGTH && self.e_array(o) {
+            let n = self.array_len(o);
+            return Ok(self.numero(f64::from(n)));
         }
         if c == fixos::LENGTH && self.e_objeto(o) && self.formas.get(self.forma(o)).classe == Classe::ArrayTipado {
             // shortcut: não confere se alguém trocou o getter `length` no protótipo; conferir se aparecer site que troca.
@@ -2083,11 +2882,7 @@ impl Motor {
                 }
             };
             if let Some((dono, forma_dono, slot)) = cp {
-                let e = &mut self.protos[proto].caches[ci as usize];
-                e.forma = fo.0;
-                e.dono = dono;
-                e.forma_dono = forma_dono;
-                e.deslocamento = slot;
+                self.guardar_no_cache(proto, ci, c, CacheProp { forma: fo.0, deslocamento: slot, dono, forma_dono, poli: SEM_POLI });
             }
         }
         Ok(v)
@@ -2096,10 +2891,11 @@ impl Motor {
     fn gravar_prop_cache(&mut self, proto: usize, ci: u32, o: Valor, c: Chave, v: Valor, estrito: bool) -> Res<()> {
         if o.e_ref() {
             let fo = self.forma(o).0;
-            let cache = self.protos[proto].caches[ci as usize];
-            if cache.forma == fo && cache.dono == Valor::UNDEFINED {
-                self.gravar_campo(o, cache.deslocamento, v);
-                return Ok(());
+            if let Some(cache) = self.entrada_do_cache(proto, ci, fo, c) {
+                if cache.dono == Valor::UNDEFINED {
+                    self.gravar_campo(o, cache.deslocamento, v);
+                    return Ok(());
+                }
             }
         }
         self.gravar(o, ChaveProp::Nome(c), v, estrito)?;
@@ -2108,10 +2904,7 @@ impl Motor {
             if !self.formas.get(fo).dicionario && !(c == fixos::LENGTH && self.e_array(o)) {
                 if let Some(d) = self.propria(o, c) {
                     if d.attrs & (attr::ACESSOR | attr::GRAVAVEL) == attr::GRAVAVEL {
-                        let e = &mut self.protos[proto].caches[ci as usize];
-                        e.forma = fo.0;
-                        e.dono = Valor::UNDEFINED;
-                        e.deslocamento = d.slot;
+                        self.guardar_no_cache(proto, ci, c, CacheProp { forma: fo.0, deslocamento: d.slot, dono: Valor::UNDEFINED, forma_dono: u32::MAX, poli: SEM_POLI });
                     }
                 }
             }
@@ -2194,5 +2987,92 @@ mod testes_pilha {
         let e = m.avaliar("let a = 1;\nlet b = ;").unwrap_err();
         let t = m.texto_do_erro(e);
         assert!(t.contains("(linha 2, coluna 9)"), "{t}");
+    }
+}
+
+#[cfg(test)]
+mod testes_entrada_hostil {
+    use crate::Motor;
+
+    /// Script de página não derruba o processo: cada caso vira erro JS (a thread de teste tem
+    /// pilha de 2 MB, então estouro de pilha aqui aborta o teste).
+    #[test]
+    fn entrada_hostil_vira_erro_js() {
+        let fundo = |abre: &str, meio: &str, fecha: &str| format!("x = {}{meio}{};", abre.repeat(100_000), fecha.repeat(100_000));
+        let mut m = Motor::novo();
+        for fonte in [fundo("[", "", "]"), fundo("(", "1", ")"), fundo("", "1", "**1"), fundo("", "o", ".o"), fundo("function a(){", "", "}")] {
+            let e = m.avaliar(&fonte).unwrap_err();
+            assert!(m.texto_do_erro(e).contains("SyntaxError"), "{}", &fonte[..20]);
+        }
+        // Cadeia funda à esquerda (texto montado com `+`) compila num laço: não é erro.
+        let v = m.avaliar(&fundo("", "1", "+1")).unwrap_or_else(|e| panic!("{}", m.texto_do_erro(e)));
+        assert_eq!(m.para_texto_rust(v).unwrap(), "100001");
+        let v = m
+            .avaliar(
+                "const r = [];
+                 const casos = [
+                   () => { const o = { get x() { return this.x; } }; o.x; },
+                   () => { const o = { toString() { return '' + o; } }; '' + o; },
+                   () => { function f() { return [1].map(f); } f(); },
+                   () => { const p = new Proxy({}, { get(t, k, r) { return r[k]; } }); p.x; },
+                   () => { let s = 'ab'; for (;;) s = s + s; },
+                   () => new RegExp('('.repeat(100000) + ')'.repeat(100000)),
+                   () => new ArrayBuffer(4294967295),
+                   () => { let p = {x: 1}; for (let i = 0; i < 100000; i++) p = new Proxy(p, {}); p.x; },
+                   () => { let f = function () {}; for (let i = 0; i < 100000; i++) f = f.bind(null); new f(); },
+                   () => { let o = {}; for (let i = 0; i < 100000; i++) o = {o}; JSON.stringify(o); },
+                   () => { let a = []; for (let i = 0; i < 100000; i++) a = [a]; a.flat(Infinity); },
+                   () => 2n ** (2n ** 24n),
+                   () => BigInt('9'.repeat(1e7)),
+                 ];
+                 for (const f of casos) {
+                   try { f(); r.push('rodou'); } catch (e) { r.push(e.name); }
+                 }
+                 const a = [1, 2];
+                 a.length = 4294967295;
+                 try { a.push(7, 8); } catch (e) { r.push(e.name); }
+                 r.push(a[0]);
+                 r.join(',')",
+            )
+            .unwrap_or_else(|e| panic!("{}", m.texto_do_erro(e)));
+        assert_eq!(
+            m.para_texto_rust(v).unwrap(),
+            "RangeError,RangeError,RangeError,RangeError,RangeError,SyntaxError,RangeError,RangeError,RangeError,RangeError,RangeError,RangeError,SyntaxError,RangeError,1"
+        );
+    }
+}
+
+#[cfg(test)]
+mod testes_perfil {
+    use crate::Motor;
+
+    /// Caches de propriedade com 1, 2-4 e 5+ formas leem o certo (inclusive do protótipo, depois
+    /// de o protótipo mudar e de o coletor mover tudo), e o perfil anota tipos e calor.
+    #[test]
+    fn caches_polimorficos_e_perfil() {
+        let mut m = Motor::novo();
+        m.estresse = true;
+        let v = m
+            .avaliar(
+                "function ler(o) { return o.v; }
+                 function gravar(o, x) { o.v = x; return o.v; }
+                 const base = {v: 'proto'};
+                 const formas = [{v: 1}, {a: 1, v: 2}, {b: 1, v: 3}, {c: 1, v: 4}, {d: 1, v: 5}, {e: 1, v: 6}, Object.create(base)];
+                 let r = [];
+                 for (let k = 0; k < 3; k++) for (const o of formas) { r.push(ler(o)); r.push(gravar({w: 0, v: 0}, k)); }
+                 base.v = 'mudou';
+                 Object.defineProperty(base, 'outra', {value: 1});
+                 r.push(ler(formas[6]));
+                 function conta(a, b) { return a + b; }
+                 conta(1, 2); conta(1.5, 2); conta('a', 1); conta(2 ** 29, 2 ** 29);
+                 r.join()",
+            )
+            .unwrap_or_else(|e| panic!("{}", m.texto_do_erro(e)));
+        let uma = "1,0,2,0,3,0,4,0,5,0,6,0,proto,0";
+        let esperado = format!("{uma},{},{},mudou", uma.replace(",0", ",1"), uma.replace(",0", ",2"));
+        assert_eq!(m.para_texto_rust(v).unwrap(), esperado);
+        let r = m.relatorio_perfil();
+        assert!(r.contains("ler: 22 chamadas") && r.contains("megamórfico"), "{r}");
+        assert!(r.contains("int|double|texto|estourou"), "{r}");
     }
 }

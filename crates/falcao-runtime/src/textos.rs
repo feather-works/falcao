@@ -8,6 +8,7 @@
 //! ```
 
 use crate::formas::{self, Chave};
+use crate::funcoes::Res;
 use crate::motor::Motor;
 use crate::valor::Valor;
 use std::cmp::Ordering;
@@ -94,9 +95,40 @@ impl Motor {
     }
 
     pub fn texto_u16(&mut self, u: &[u16]) -> Valor {
+        // Grande: estreita e confere numa passada só; se aparecer unidade larga, a área Latin1
+        // fica de lixo (o coletor leva) e o texto sai em UTF-16.
+        if u.len() >= 4096 && u.len() as u32 <= TEXTO_MAX {
+            let n = u.len() as u32;
+            let d = self.g.alocar(16 + n);
+            // Cabeçalho válido antes de tudo: mesmo descartada, a área é um objeto que o coletor
+            // percorre.
+            self.g.por_u32(d, formas::LATIN1.0);
+            self.g.por_u32(d + 4, n);
+            let mut alto = 0u16;
+            for (x, &c) in self.g.bytes_mut(d + 16, n).iter_mut().zip(u) {
+                *x = c as u8;
+                alto |= c;
+            }
+            if alto < 256 {
+                return Valor::de_deslocamento(d);
+            }
+        }
         if u.iter().all(|&c| c < 256) {
-            let b: Vec<u8> = u.iter().map(|&c| c as u8).collect();
-            return self.texto_latin1(&b);
+            match u.len() {
+                0 => return Valor::VAZIA,
+                1 => return self.caracteres[u[0] as usize],
+                _ => {}
+            }
+            // Estreita direto na gaiola, sem `Vec` no meio.
+            let n = u.len() as u32;
+            assert!(n <= TEXTO_MAX, "texto grande demais");
+            let d = self.g.alocar(16 + n);
+            self.g.por_u32(d, formas::LATIN1.0);
+            self.g.por_u32(d + 4, n);
+            for (x, &c) in self.g.bytes_mut(d + 16, n).iter_mut().zip(u) {
+                *x = c as u8;
+            }
+            return Valor::de_deslocamento(d);
         }
         let n = u.len() as u32;
         assert!(n <= TEXTO_MAX, "texto grande demais");
@@ -123,8 +155,9 @@ impl Motor {
         }
         let u = self.nomes.texto(c).to_vec();
         let v = self.texto_u16(&u);
-        // Lembra no próprio texto que ele já é o nome `c` (se não for um fixo compartilhado).
-        if v != Valor::VAZIA && !(u.len() == 1 && u[0] < 256) {
+        // Lembra no próprio texto que ele já é o nome `c` (se não for um fixo compartilhado). Um
+        // índice ("10") não: como chave ele é `Indice`, e o cache faria `chave_de_texto` dar nome.
+        if v != Valor::VAZIA && !(u.len() == 1 && u[0] < 256) && indice_de_array(&u).is_none() {
             self.g.por_u32(v.deslocamento() + 12, c.0 + 1);
         }
         self.nomes.valores[c.0 as usize] = v;
@@ -233,28 +266,29 @@ impl Motor {
 
     // ---------------------------------------------------------------- operações
 
-    pub fn concatenar(&mut self, a: Valor, b: Valor) -> Valor {
+    pub fn concatenar(&mut self, a: Valor, b: Valor) -> Res<Valor> {
         let (la, lb) = (self.texto_len(a), self.texto_len(b));
         if la == 0 {
-            return b;
+            return Ok(b);
         }
         if lb == 0 {
-            return a;
+            return Ok(a);
         }
         let n = la + lb;
-        // shortcut: passou do máximo dá pânico; a sintaxe certa é RangeError (vem com as exceções).
-        assert!(n <= TEXTO_MAX, "texto grande demais");
+        if n > TEXTO_MAX {
+            return self.erro_alcance("Invalid string length");
+        }
         if n < CORDA_MIN {
             let mut u = self.texto_u16_de(a);
             u.extend(self.texto_u16_de(b));
-            return self.texto_u16(&u);
+            return Ok(self.texto_u16(&u));
         }
         let d = self.g.alocar(24);
         self.g.por_u32(d, formas::CORDA.0);
         self.g.por_u32(d + 4, n);
         self.g.por_valor(d, d + 16, a);
         self.g.por_valor(d, d + 20, b);
-        Valor::de_deslocamento(d)
+        Ok(Valor::de_deslocamento(d))
     }
 
     /// `texto.substring(ini, fim)` (índices já validados, `ini <= fim <= len`).
@@ -352,7 +386,7 @@ mod testes {
         let mut m = Motor::novo();
         let a = m.texto("olá, ");
         let b = m.texto("mundo grande e bonito");
-        let c = m.concatenar(a, b);
+        let c = m.concatenar(a, b).unwrap();
         assert_eq!(m.forma(c), formas::CORDA);
         assert_eq!(m.texto_len(c), 26);
         assert_eq!(m.texto_rust(c), "olá, mundo grande e bonito");
@@ -360,7 +394,7 @@ mod testes {
         let mut s = Valor::VAZIA;
         for _ in 0..100_000 {
             let x = m.texto("ab");
-            s = m.concatenar(s, x);
+            s = m.concatenar(s, x).unwrap();
         }
         assert_eq!(m.texto_len(s), 200_000);
         assert_eq!(m.unidade_em(s, 199_999), b'b' as u16);

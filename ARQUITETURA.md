@@ -1,7 +1,9 @@
 # Falcão: como o JavaScript é compilado
 
-Projeto da arquitetura, escrito em 18/10/2026 a pedido do usuário. Nada daqui foi
-implementado ainda; as metas e as fases estão em `featherweb/docs/js/PLANO-JIT.md`. Tudo é
+Projeto da arquitetura, escrito em 18/10/2026 a pedido do usuário. Já existem a sintaxe, o
+bytecode, o intérprete N1 em Rust, o runtime e o coletor (seções 2–9, 13 e 14); o N2, o N3
+e os caches em disco ainda são plano. As metas e as fases estão em
+`featherweb/docs/js/PLANO-JIT.md`. Tudo é
 escrito por nós: os nomes das instruções, os formatos e os algoritmos são deste projeto.
 Do V8 e do SpiderMonkey só se usa o comportamento observado de fora (regra 8 do `CLAUDE.md`).
 
@@ -269,6 +271,34 @@ lento:
 - Como o quadro é o mesmo do N1, a troca de nível pode acontecer em qualquer `SALTA_ATRAS`
   (troca no meio do laço, OSR).
 
+### O montador: `falcao-asm`
+
+Crate próprio, sem dependências, que o N2 usa para escrever código de máquina x86-64.
+
+- `Montador`: `mov` (registrador, imediato de 32/64 bits, memória), grupo 1 (`add`/`or`/`and`/
+  `sub`/`xor`/`cmp`) com registrador, imediato e memória, `test`, `imul`, `not`/`neg`/`inc`/
+  `dec`, deslocamentos por imediato e por `cl`, `lea`, `push`/`pop`, `call`/`jmp` por rótulo e
+  por registrador, `jcc`/`setcc`/`cmovcc` nas 16 condições, `movzx`/`movsx`/`movsxd`, SSE2 para
+  doubles (`movsd`, `movq`, `addsd`…`divsd`, `ucomisd`, `cvtsi2sd`, `cvttsd2si`), `nop` de 1 a
+  9 bytes, `alinhar` e `int3`. Endereços `[base + índice*escala + desl]` com os casos especiais
+  (rsp/r12 com SIB, rbp/r13 com disp8 0, r8-r15 pelo REX).
+- Rótulos: para trás usa `rel8` quando cabe; para frente, sempre `rel32` (a distância ainda não
+  se sabe, e trocar o tamanho depois deslocaria o código já escrito).
+- `CodigoExecutavel`: `mmap` leitura + escrita, copia, `mprotect` para leitura + execução. Só Linux
+  x86-64 por ora; nas outras plataformas devolve `Erro::SemSuporte`. Chamada por
+  `chamar2(a, b)` (System V) ou `chamar_com(&mut contexto)`, ambas `unsafe`: o código é
+  arbitrário, e quem gera garante que ele respeita a convenção.
+
+Regras de segurança aplicadas (seção 18):
+- W^X: a página nunca é gravável e executável ao mesmo tempo, nem por um instante; o teste lê
+  `/proc/self/maps` e confere `r-x`.
+- Todo `unsafe` do crate fica em `memoria.rs`, com o porquê ao lado de cada bloco.
+- Tamanho limitado (`MAX_CODIGO`, 16 MB): os `rel32` sempre cabem e código vazio é recusado.
+- Rótulo usado e nunca ligado, ou ligado duas vezes, é erro em `finalizar`, nunca um salto para
+  lixo.
+- Codificação conferida contra o `objdump`: todas as formas, com os 16 registradores onde cabe
+  (~20 mil instruções), mais 12 mil instruções aleatórias de memória e imediatos, por teste.
+
 ## 11. N3: JIT otimizador
 
 **1. Grafo SSA**, construído do bytecode e dos caches. Cada aposta vira uma **guarda**
@@ -402,3 +432,69 @@ disco) só acrescenta, não troca o que já existe.
 Correspondência com as fases do `PLANO-JIT.md`: os itens 1 a 5 cobrem o J1 **e** o J2
 juntos (formas, caches e valores de 32 bits deixam de ser uma fase à parte), o 6 é o J3,
 o 7 é o J4, e o 8 cobre do J5 ao J8.
+
+## 18. Roteiro e metas (27/10/2026)
+
+Onde estamos: a base (itens 1 a 4 da seção 17) roda, sem JIT. Medido contra o shell do
+SpiderMonkey 157 (o motor do Firefox) e o Node 22, com e sem JIT (SpiderMonkey com
+`--no-blinterp --no-baseline --no-ion`, Node com `--jitless`), nos testes de
+`ferramentas/velocidade/`; conformidade pelo test262.
+
+**Feito**
+- Robustez: 88 scripts hostis (pilha funda, Proxy/`bind` encadeados, memória, laços em
+  nativa, regex e BigInt explosivos, fugas de CSP) viram erro JS ou são interrompidos;
+  nenhum derruba o processo. Guarda de pilha por endereço (`Motor::limite_pilha`), teto da
+  gaiola, `tique` nos laços de nativas, coletor dentro dos callbacks de array/Map/Set.
+- Intérprete no nível do SpiderMonkey sem JIT: ganha em recursão, closures, arrays e
+  textos; empata no laço de inteiros e em Map/Set; perde em propriedades, JSON, `sort` e
+  regex.
+
+**Agora**
+- Perfil completo no N1 (feedback de tipos nos caches, contadores de laço, cache de
+  propriedade polimórfico): o que o N2 e o N3 vão ler.
+- Funções nativas: JSON, `sort`, regex, Map/Set.
+
+**Próximo, em ordem**
+1. Quadro de pilha definitivo (seção 9), lido direto pelo código de máquina.
+2. `falcao-asm`: montador x86-64, memória executável com W^X, sem dependências.
+3. N2 (seção 10). Primeiro só inteiros, `Carrega`/`Guarda`, saltos e `SaltaAtras`; depois
+   instrução por instrução, com um modo "JIT em tudo" rodando o test262 e a bateria hostil.
+4. Conformidade, em paralelo: test262 em 72% (expressões) e 67% (comandos), o
+   SpiderMonkey em 95% e 99%.
+5. Troca do `boa` no `featherweb-js` (item 5 da seção 17).
+6. N3 e desotimização (seções 11 e 12).
+7. Caches em disco (seção 15), AArch64.
+
+**Regras de segurança do JIT (N2/N3)**
+Quase todo CVE grave de V8 e SpiderMonkey nos últimos anos nasceu no JIT: o otimizador
+supõe algo (tipo, forma, tamanho, faixa de um inteiro) e um efeito colateral desfaz a
+suposição sem que o código otimizado perceba (CVE-2019-11707 `Array.pop`, CVE-2020-6418,
+CVE-2021-30551, CVE-2023-2033, CVE-2024-4947). Regras para o Falcão já nascer imune:
+1. Nenhuma verificação de limite é removida sem prova. Análise de faixa só remove um
+   teste se a prova for refeita no próprio código gerado (comparação com o `length` lido
+   *depois* do último efeito colateral). Na dúvida, o teste fica.
+2. Toda chamada, getter, `valueOf`/`toString`, armadilha de Proxy, `Symbol.species` e
+   alocação (pode coletar) é efeito colateral: invalida forma, `length`, tipo dos
+   elementos e ponteiros para a gaiola. Depois dela, ou se confere de novo, ou se desotimiza.
+3. Nenhuma suposição de tipo atravessa uma chamada. O que o perfil viu vira guarda
+   (salto para desotimização), nunca premissa.
+4. Desotimização sempre possível e testada: cada guarda tem um ponto de volta para o N1,
+   e o modo "desotimiza em toda guarda" roda o test262 e a bateria hostil.
+5. Memória executável W^X: escreve, troca para só execução, nunca as duas. Nada de
+   código gerado em página gravável.
+6. Índices e tamanhos em `u32`/`u64` com conta conferida (`checked_*`), nunca `i32` com
+   sinal misturado; deslocamento na gaiola sempre `< topo`, com teste no código gerado.
+7. O coletor nunca roda com valor vivo só em registrador de máquina: todo ponto seguro
+   tem mapa de raízes (o mesmo contrato de `seguro`/`raizes` das nativas).
+8. Portão de entrada de cada instrução no JIT: o modo "JIT em tudo" passa no test262 e na
+   bateria hostil (incluindo `s_*`, que reproduz as classes de CVE), mais uma rodada de
+   fuzzing diferencial contra o N1 (mesmo script, mesma saída) sem divergência.
+
+**Metas de velocidade**
+1. N1 entre o SpiderMonkey sem JIT e o V8 sem JIT.
+2. N2 perto do Baseline do SpiderMonkey (3 a 10× sobre o N1).
+3. Partida e memória melhores que V8 e SpiderMonkey: é onde dá para ganhar cedo.
+4. N3 + caches em disco: empate no pico; na frente na segunda visita (o código otimizado já
+   vem do disco, os outros reaquecem a cada carga).
+
+Comparar também com QuickJS, Hermes e o `boa` (que o Falcão substitui no FeatherWeb).

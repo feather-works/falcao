@@ -3,7 +3,7 @@
 use crate::conversoes::Dica;
 use crate::formas::Classe;
 use crate::funcoes::Res;
-use crate::grande::Grande;
+use crate::grande::{Grande, MAX_BITS};
 use crate::intrinsecos::simb;
 use crate::motor::Motor;
 use crate::nomes::fixos;
@@ -50,14 +50,14 @@ impl Motor {
             return Ok(self.numero(x));
         }
         if self.e_texto(a) && self.e_texto(b) {
-            return Ok(self.concatenar(a, b));
+            return self.concatenar(a, b);
         }
         let pa = self.para_primitivo(a, Dica::Padrao)?;
         let pb = self.para_primitivo(b, Dica::Padrao)?;
         if self.e_texto(pa) || self.e_texto(pb) {
             let ta = self.para_texto(pa)?;
             let tb = self.para_texto(pb)?;
-            return Ok(self.concatenar(ta, tb));
+            return self.concatenar(ta, tb);
         }
         let pa = self.para_numerico(pa)?;
         let pb = self.para_numerico(pb)?;
@@ -93,6 +93,7 @@ impl Motor {
         if let Some((x, y)) = self.dois_bigint(a, b)? {
             let r = match op {
                 Arit::Sub => Ok(x.subtrair(&y)),
+                Arit::Mul if x.bits() + y.bits() > MAX_BITS + 1 => Err("Maximum BigInt size exceeded"),
                 Arit::Mul => Ok(x.multiplicar(&y)),
                 Arit::Div | Arit::Resto => match x.dividir(&y) {
                     Some((q, r)) => Ok(if op == Arit::Div { q } else { r }),
@@ -114,8 +115,10 @@ impl Motor {
     }
 
     pub fn bits(&mut self, op: Bits, a: Valor, b: Valor) -> Res<Valor> {
-        let (a, b) = if a.e_int() && b.e_int() { (a, b) } else { (self.para_numerico(a)?, self.para_numerico(b)?) };
-        if let Some((x, y)) = self.dois_bigint(a, b)? {
+        // Número com número (o `x | 0` de sempre) não precisa olhar BigInt.
+        let numeros = self.e_numero(a) && self.e_numero(b);
+        let (a, b) = if numeros { (a, b) } else { (self.para_numerico(a)?, self.para_numerico(b)?) };
+        if let Some((x, y)) = if numeros { None } else { self.dois_bigint(a, b)? } {
             let r = match op {
                 Bits::E => Ok(x.bit_a_bit(&y, |p, q| p & q)),
                 Bits::Ou => Ok(x.bit_a_bit(&y, |p, q| p | q)),
@@ -151,6 +154,11 @@ impl Motor {
         if self.e_numero(a) {
             let x = self.f64_de(a) + f64::from(i);
             return Ok(self.numero(x));
+        }
+        // O gerador só emite imediato positivo para `+`; negativo vem de `x - n`, que converte
+        // para número (`"5" - 1` é 4, não "5-1").
+        if i < 0 {
+            return self.aritmetica(Arit::Sub, a, Valor::int(-i));
         }
         self.somar(a, Valor::int(i))
     }
