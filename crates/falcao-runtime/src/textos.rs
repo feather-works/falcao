@@ -173,12 +173,24 @@ impl Motor {
 
     /// Versão plana do texto (achata a corda, se for).
     pub fn achatar(&mut self, v: Valor) -> Valor {
+        self.achatar_em(v, false).expect("achatar sem reserva não falha")
+    }
+
+    /// [`Motor::achatar`] que dá RangeError se a gaiola não conseguir a memória do texto plano.
+    pub(crate) fn achatar_res(&mut self, v: Valor) -> Res<Valor> {
+        match self.achatar_em(v, true) {
+            Some(p) => Ok(p),
+            None => self.erro_alcance("Out of memory"),
+        }
+    }
+
+    fn achatar_em(&mut self, v: Valor, falivel: bool) -> Option<Valor> {
         if self.forma(v) != formas::CORDA {
-            return v;
+            return Some(v);
         }
         let d = v.deslocamento();
         if self.g.valor_em(d + 20) == Valor::VAZIA {
-            return self.g.valor_em(d + 16);
+            return Some(self.g.valor_em(d + 16));
         }
         let n = self.texto_len(v);
         // Folhas da esquerda para a direita, sem recursão (cordas de `s += x` são fundas).
@@ -199,34 +211,32 @@ impl Motor {
                 }
             }
         }
-        let plano = if latin1 {
-            let mut buf = Vec::with_capacity(n as usize);
-            for f in folhas {
-                let (df, nf) = (f.deslocamento(), self.texto_len(f));
-                buf.extend_from_slice(self.g.bytes(df + 16, nf));
+        // Monta direto na gaiola, folha a folha (sem `Vec` do tamanho do texto no meio).
+        let bytes = if latin1 { n } else { 2 * n };
+        if falivel && n >= 1 << 20 && !self.g.reservar(16 + u64::from(bytes)) {
+            return None;
+        }
+        let dp = self.g.alocar(16 + bytes);
+        self.g.por_u32(dp, if latin1 { formas::LATIN1.0 } else { formas::UTF16.0 });
+        self.g.por_u32(dp + 4, n);
+        let mut em = dp + 16;
+        for f in folhas {
+            let (df, nf) = (f.deslocamento(), self.texto_len(f));
+            if latin1 || self.g.u32_em(df) == formas::UTF16.0 {
+                let b = if latin1 { nf } else { 2 * nf };
+                self.g.copiar(df + 16, em, b);
+                em += b;
+            } else {
+                let w: Vec<u16> = self.g.bytes(df + 16, nf).iter().map(|&c| u16::from(c)).collect();
+                self.g.u16s_mut(em, nf).copy_from_slice(&w);
+                em += 2 * nf;
             }
-            self.texto_latin1(&buf)
-        } else {
-            let mut buf: Vec<u16> = Vec::with_capacity(n as usize);
-            for f in folhas {
-                buf.extend_from_slice(&self.unidades_planas(f).para_u16());
-            }
-            self.texto_u16_cru(&buf)
-        };
+        }
+        let plano = Valor::de_deslocamento(dp);
         let d = v.deslocamento();
         self.g.por_valor(d, d + 16, plano);
         self.g.por_valor(d, d + 20, Valor::VAZIA);
-        plano
-    }
-
-    fn texto_u16_cru(&mut self, u: &[u16]) -> Valor {
-        let n = u.len() as u32;
-        assert!(n <= TEXTO_MAX, "texto grande demais");
-        let d = self.g.alocar(16 + 2 * n);
-        self.g.por_u32(d, formas::UTF16.0);
-        self.g.por_u32(d + 4, n);
-        self.g.u16s_mut(d + 16, n).copy_from_slice(u);
-        Valor::de_deslocamento(d)
+        Some(plano)
     }
 
     /// Unidades de um texto **plano**.
@@ -246,6 +256,34 @@ impl Motor {
     pub fn unidades(&mut self, v: Valor) -> Unidades<'_> {
         let p = self.achatar(v);
         self.unidades_planas(p)
+    }
+
+    /// [`Motor::texto_u16`] que, com texto grande, confere antes se a gaiola consegue a
+    /// memória: RangeError em vez de derrubar o processo.
+    pub fn texto_u16_res(&mut self, u: &[u16]) -> Res<Valor> {
+        if u.len() >= 1 << 20 {
+            if u.len() > TEXTO_MAX as usize {
+                return self.erro_alcance("Invalid string length");
+            }
+            // Reserva o bloco Latin-1 que `texto_u16` tenta primeiro (sem varrer o texto duas vezes).
+            if !self.g.reservar(16 + u.len() as u64) {
+                return self.erro_alcance("Out of memory");
+            }
+        }
+        Ok(self.texto_u16(u))
+    }
+
+    /// Texto plano novo de `n` unidades (zeradas, `n` >= 2) para a nativa preencher no lugar,
+    /// sem `Vec` no meio; RangeError se a gaiola não conseguir a memória.
+    pub(crate) fn texto_plano_novo(&mut self, n: u32, latin1: bool) -> Res<Valor> {
+        let bytes = if latin1 { n } else { 2 * n };
+        if n > TEXTO_MAX || !self.g.reservar(16 + u64::from(bytes)) {
+            return self.erro_alcance(if n > TEXTO_MAX { "Invalid string length" } else { "Out of memory" });
+        }
+        let d = self.g.alocar(16 + bytes);
+        self.g.por_u32(d, if latin1 { formas::LATIN1.0 } else { formas::UTF16.0 });
+        self.g.por_u32(d + 4, n);
+        Ok(Valor::de_deslocamento(d))
     }
 
     pub fn texto_u16_de(&mut self, v: Valor) -> Vec<u16> {
@@ -279,6 +317,22 @@ impl Motor {
             return self.erro_alcance("Invalid string length");
         }
         if n < CORDA_MIN {
+            // Os dois em Latin-1 (o comum: `'k' + i`): os bytes juntos direto, sem passar por
+            // UTF-16 nem pelo `malloc`.
+            let mut buf = [0u8; CORDA_MIN as usize];
+            let mut k = 0;
+            for v in [a, b] {
+                match self.unidades(v) {
+                    Unidades::Latin1(x) => {
+                        buf[k..k + x.len()].copy_from_slice(x);
+                        k += x.len();
+                    }
+                    Unidades::Utf16(_) => break,
+                }
+            }
+            if k == n as usize {
+                return Ok(self.texto_latin1(&buf[..k]));
+            }
             let mut u = self.texto_u16_de(a);
             u.extend(self.texto_u16_de(b));
             return Ok(self.texto_u16(&u));

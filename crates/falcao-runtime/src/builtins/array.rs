@@ -8,6 +8,7 @@ use crate::motor::Motor;
 use crate::nomes::fixos;
 use crate::textos::{ChaveProp, TEXTO_MAX};
 use crate::valor::Valor;
+use super::regexp::anexar;
 use std::cmp::Ordering;
 
 pub(super) fn instalar(m: &mut Motor) {
@@ -218,8 +219,31 @@ fn indice_inteiro(t: &[u16]) -> Option<u64> {
     Some(t.iter().fold(0u64, |n, &c| n * 10 + u64::from(c - 0x30)))
 }
 
+/// Nenhum índice existe em `o` nem nos protótipos dele (objetos comuns, sem itens na lista, e
+/// nenhum índice guardado como nome no motor): ler qualquer índice dá undefined sem rodar JS.
+fn sem_itens(m: &Motor, o: Valor) -> bool {
+    if m.indices_especiais {
+        return false;
+    }
+    let mut x = o;
+    for _ in 0..64 {
+        if x == Valor::NULL {
+            return true;
+        }
+        if !m.e_objeto(x) {
+            return false;
+        }
+        let f = m.formas.get(m.forma(x));
+        if f.classe != Classe::Comum || f.dicionario || m.elementos(x) != Valor::LISTA_VAZIA {
+            return false;
+        }
+        x = f.proto;
+    }
+    false
+}
+
 fn num(m: &mut Motor, i: u64) -> Valor {
-    m.numero(i as f64)
+    Valor::int_se_cabe(i as i64).unwrap_or_else(|| m.numero(i as f64))
 }
 
 // ---------------------------------------------------------------- construtor e estáticos
@@ -323,12 +347,26 @@ fn from(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
         let o = m.para_objeto(src)?;
         let n = m.comprimento_de(o)?;
         let mut v = Vec::with_capacity(n.min(1 << 20) as usize);
-        for i in 0..n {
-            v.push(ler(m, o, i)?);
+        if sem_itens(m, o) {
+            // `Array.from({ length: n }, f)`: nenhum item em lugar nenhum, ler não roda nada.
+            for _ in 0..n {
+                m.tique()?;
+                v.push(Valor::UNDEFINED);
+            }
+        } else {
+            for i in 0..n {
+                v.push(ler(m, o, i)?);
+            }
         }
         v
     };
     let r = novo_array(m);
+    // A lista já com os lugares (os itens existem: `itens` já os tem), sem esticar a cada um.
+    if !itens.is_empty() && itens.len() <= u32::MAX as usize {
+        let l = m.redimensionar_lista(Valor::LISTA_VAZIA, itens.len() as u32, Valor::BURACO);
+        let d = r.deslocamento();
+        m.g.por_valor(d, d + 8, l);
+    }
     for (i, x) in itens.into_iter().enumerate() {
         let v = if f != Valor::UNDEFINED {
             let iv = num(m, i as u64);
@@ -462,18 +500,53 @@ fn percorrer_raizes(
     m: &mut Motor,
     base: usize,
     n: u64,
+    para: impl FnMut(&mut Motor, Valor, Valor, u64, Valor) -> Res<bool>,
+) -> Res<()> {
+    let mut rep = None;
+    let r = percorrer_com(m, base, n, para, &mut rep);
+    m.soltar(&mut rep);
+    r
+}
+
+/// O laço de [`percorrer_raizes`]. Com o callback no N2, as chamadas vão pelo repetidor
+/// (`rep`): o quadro dele fica empurrado enquanto os itens vêm direto da lista, e sai antes de
+/// qualquer coisa que rode JS ou lance aqui (item ausente, getter, interrupção). `para` não roda
+/// JS.
+fn percorrer_com(
+    m: &mut Motor,
+    base: usize,
+    n: u64,
     mut para: impl FnMut(&mut Motor, Valor, Valor, u64, Valor) -> Res<bool>,
+    rep: &mut Option<crate::interpretador::Repetidor>,
 ) -> Res<()> {
     for i in 0..n {
         let o = m.raizes[base];
-        if !tem(m, o, i)? {
-            continue;
-        }
-        let v = ler(m, o, i)?;
+        // Item próprio na lista (o caso comum): `tem` e `ler` de uma vez.
+        let v = match (i < u64::from(u32::MAX)).then(|| m.elemento_rapido(o, i as u32)).flatten() {
+            Some(v) => {
+                m.voltas = m.voltas.wrapping_add(1);
+                if m.voltas & 0xFFFF == 0 {
+                    m.soltar(rep);
+                    m.voltas = m.voltas.wrapping_sub(1);
+                    m.tique()?;
+                }
+                v
+            }
+            None => {
+                m.soltar(rep);
+                if !tem(m, o, i)? {
+                    continue;
+                }
+                ler(m, o, i)?
+            }
+        };
         m.raizes[base + 4] = v;
         let iv = num(m, i);
         let (f, t) = (m.raizes[base + 1], m.raizes[base + 2]);
-        let r = m.chamar_coletavel(f, t, &[v, iv, o])?;
+        if rep.is_none() {
+            *rep = m.repetidor(f, t, 3);
+        }
+        let r = if rep.is_some() { m.repetir(rep, &[v, iv, o])? } else { m.chamar_coletavel(f, t, &[v, iv, o])? };
         let (extra, v) = (m.raizes[base + 3], m.raizes[base + 4]);
         if para(m, extra, v, i, r)? {
             break;
@@ -533,6 +606,16 @@ fn map(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     }
     let r = novo_array(m);
     m.definir_array_len(r, n as u32);
+    // Origem densa: a lista do resultado já com os `n` lugares (buracos), sem esticar a cada
+    // item (a origem já ocupa isso, então não é `length` enorme sem itens).
+    if n > 0 && m.e_array(o) {
+        let el = m.elementos(o);
+        if el != Valor::LISTA_VAZIA && u64::from(m.lista_len(el)) >= n {
+            let l = m.redimensionar_lista(Valor::LISTA_VAZIA, n as u32, Valor::BURACO);
+            let d = r.deslocamento();
+            m.g.por_valor(d, d + 8, l);
+        }
+    }
     percorrer(m, o, n, a, r, |m, r, _, i, x| {
         m.gravar_elemento(r, i as u32, x);
         Ok(false)
@@ -634,19 +717,39 @@ fn reduzir(m: &mut Motor, this: Valor, a: Args, do_fim: bool) -> Res<Valor> {
     // O coletor roda no callback: o objeto, o callback e o acumulado moram em `raizes`.
     let base = m.raizes.len();
     m.raizes.extend([o, f, acc]);
+    // Com o callback no N2, pelo repetidor (como em `percorrer_com`).
+    let mut rep = None;
     let r = (|| {
         for i in ordem {
             let o = m.raizes[base];
-            if !tem(m, o, i)? {
-                continue;
-            }
-            let v = ler(m, o, i)?;
+            let v = match (i < u64::from(u32::MAX)).then(|| m.elemento_rapido(o, i as u32)).flatten() {
+                Some(v) => {
+                    m.voltas = m.voltas.wrapping_add(1);
+                    if m.voltas & 0xFFFF == 0 {
+                        m.soltar(&mut rep);
+                        m.voltas = m.voltas.wrapping_sub(1);
+                        m.tique()?;
+                    }
+                    v
+                }
+                None => {
+                    m.soltar(&mut rep);
+                    if !tem(m, o, i)? {
+                        continue;
+                    }
+                    ler(m, o, i)?
+                }
+            };
             let iv = num(m, i);
             let (f, acc) = (m.raizes[base + 1], m.raizes[base + 2]);
-            m.raizes[base + 2] = m.chamar_coletavel(f, Valor::UNDEFINED, &[acc, v, iv, o])?;
+            if rep.is_none() {
+                rep = m.repetidor(f, Valor::UNDEFINED, 4);
+            }
+            m.raizes[base + 2] = if rep.is_some() { m.repetir(&mut rep, &[acc, v, iv, o])? } else { m.chamar_coletavel(f, Valor::UNDEFINED, &[acc, v, iv, o])? };
         }
         Ok(m.raizes[base + 2])
     })();
+    m.soltar(&mut rep);
     m.raizes.truncate(base);
     r
 }
@@ -763,7 +866,10 @@ fn juntar(m: &mut Motor, o: Valor, sep: &[u16]) -> Res<Valor> {
             if total > u128::from(TEXTO_MAX) {
                 return m.erro_alcance("Invalid string length");
             }
-            let mut r: Vec<u16> = Vec::with_capacity(total as usize);
+            let mut r: Vec<u16> = Vec::new();
+            if r.try_reserve_exact(total as usize).is_err() {
+                return m.erro_alcance("Out of memory");
+            }
             let mut seps = 0;
             for (i, u) in textos {
                 while seps < i {
@@ -776,31 +882,30 @@ fn juntar(m: &mut Motor, o: Valor, sep: &[u16]) -> Res<Valor> {
                 r.extend_from_slice(sep);
                 seps += 1;
             }
-            return Ok(m.texto_u16(&r));
+            return m.texto_u16_res(&r);
         }
     }
     m.juntando.push(o.0);
     let mut r: Vec<u16> = Vec::new();
     let res = (|| -> Res<()> {
         for i in 0..n {
+            // O texto cresce no Rust, fora da gaiola: para no máximo de texto (ou na falta de
+            // memória) com RangeError, sem derrubar o processo.
             if i > 0 {
-                r.extend_from_slice(sep);
-            }
-            // O texto cresce no Rust, fora da gaiola: para no máximo de texto, não na RAM.
-            if r.len() > TEXTO_MAX as usize {
-                return m.erro_alcance("Invalid string length");
+                anexar(m, &mut r, sep)?;
             }
             let v = ler(m, o, i)?;
             if !v.e_nulo_ou_indefinido() {
                 let t = m.para_texto(v)?;
-                r.extend(m.texto_u16_de(t));
+                let u = m.texto_u16_de(t);
+                anexar(m, &mut r, &u)?;
             }
         }
         Ok(())
     })();
     m.juntando.pop();
     res?;
-    Ok(m.texto_u16(&r))
+    m.texto_u16_res(&r)
 }
 
 fn join(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
@@ -885,6 +990,21 @@ fn shift(m: &mut Motor, this: Valor, _a: Args, _nt: Valor) -> Res<Valor> {
         m.definir_array_len(o, n as u32 - 1);
         return Ok(primeiro);
     }
+    // Esparso e extensível: cada item vai de i para i-1 (o de 0 sai) e os buracos continuam.
+    if m.formas.get(m.forma(o)).extensivel {
+        if let Some((itens, true)) = presentes(m, o, n) {
+            for &(i, _) in &itens {
+                apagar(m, o, i)?;
+            }
+            for (i, v) in itens {
+                if i > 0 {
+                    gravar(m, o, i - 1, v)?;
+                }
+            }
+            por_len(m, o, n - 1)?;
+            return Ok(primeiro);
+        }
+    }
     for i in 1..n {
         if tem(m, o, i)? {
             let v = ler(m, o, i)?;
@@ -920,6 +1040,27 @@ fn unshift(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     let k = u64::from(a.n);
     if k > 0 {
         cabe(m, n, k)?;
+        // Array esparso e extensível: cada item vai de i para i+k. Só Array: num array-like o
+        // laço da norma também apaga [n, n+k), que `presentes` não lista.
+        let f = m.formas.get(m.forma(o));
+        // length guardado à parte = length mexido (talvez só leitura): o laço comum falha no
+        // mesmo ponto que a norma.
+        if f.classe == Classe::Array && f.extensivel && m.propria(o, fixos::LENGTH).is_none() {
+            if let Some((itens, true)) = presentes(m, o, n) {
+                for &(i, _) in &itens {
+                    apagar(m, o, i)?;
+                }
+                for (i, v) in itens {
+                    gravar(m, o, i + k, v)?;
+                }
+                for j in 0..a.n {
+                    let v = m.arg(a, j);
+                    gravar(m, o, u64::from(j), v)?;
+                }
+                por_len(m, o, n + k)?;
+                return Ok(num(m, n + k));
+            }
+        }
         let mut i = n;
         while i > 0 {
             i -= 1;
@@ -982,7 +1123,20 @@ fn slice(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     let n = m.comprimento_de(o)?;
     let ini = relativo(m, m.arg(a, 0), n, 0)?;
     let fim = relativo(m, m.arg(a, 1), n, n)?;
+    if fim.saturating_sub(ini) > u64::from(u32::MAX) {
+        return m.erro_alcance("Invalid array length");
+    }
     let r = novo_array(m);
+    // Esparso: só os itens presentes (ler e testar não rodam código neles).
+    if let Some((itens, _)) = presentes(m, o, n) {
+        for (i, v) in itens {
+            if i >= ini && i < fim {
+                criar(m, r, i - ini, v)?;
+            }
+        }
+        por_len(m, r, fim.saturating_sub(ini))?;
+        return Ok(r);
+    }
     let mut k = 0;
     for i in ini..fim.max(ini) {
         if tem(m, o, i)? {
@@ -1261,6 +1415,9 @@ fn to_sorted(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
         funcao(m, f)?;
     }
     let n = m.comprimento_de(o)?;
+    if n > u64::from(u32::MAX) {
+        return m.erro_alcance("Invalid array length");
+    }
     let mut v = Vec::new();
     for i in 0..n {
         v.push(ler(m, o, i)?);
@@ -1272,6 +1429,9 @@ fn to_sorted(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
 fn to_reversed(m: &mut Motor, this: Valor, _a: Args, _nt: Valor) -> Res<Valor> {
     let o = m.para_objeto(this)?;
     let n = m.comprimento_de(o)?;
+    if n > u64::from(u32::MAX) {
+        return m.erro_alcance("Invalid array length");
+    }
     let mut v = Vec::new();
     for i in (0..n).rev() {
         v.push(ler(m, o, i)?);
@@ -1291,6 +1451,14 @@ fn to_spliced(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
         let x = m.para_inteiro(m.arg(a, 1))?;
         (x.max(0.0) as u64).min(n - ini)
     };
+    // ArrayCreate(newLen) antes de ler qualquer item.
+    let novo = n + u64::from(a.n.max(2) - 2) - pular;
+    if novo > (1 << 53) - 1 {
+        return m.erro_tipo("Invalid array length");
+    }
+    if novo > u64::from(u32::MAX) {
+        return m.erro_alcance("Invalid array length");
+    }
     let mut v = Vec::new();
     for i in 0..ini {
         v.push(ler(m, o, i)?);
@@ -1311,6 +1479,9 @@ fn with(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     let i = if x < 0.0 { n as f64 + x } else { x };
     if i < 0.0 || i >= n as f64 {
         return m.erro_alcance("Invalid index");
+    }
+    if n > u64::from(u32::MAX) {
+        return m.erro_alcance("Invalid array length");
     }
     let mut v = Vec::new();
     for j in 0..n {
@@ -1358,6 +1529,23 @@ mod testes {
                  r.join('|')"
             ),
             "1|1|2|2|3|3"
+        );
+    }
+
+    #[test]
+    fn slice_shift_unshift_esparsos_e_criacao_grande_demais() {
+        assert_eq!(
+            rodar(
+                "var a = []; a[4294967290] = 'u'; a[1] = 'b'; a.length = 4294967295; var r = []; \
+                 var s = a.slice(4294967289); r.push(s.length, s[1], Object.keys(s).length); \
+                 a.shift(); r.push(a.length, a[0], a[4294967289]); \
+                 a.unshift('z'); r.push(a.length, a[0], a[1], a[4294967290]); \
+                 try { Array.prototype.toReversed.call({ length: 2 ** 32 }); } catch (e) { r.push(e.name); } \
+                 var o = { 0: 1, 1: 1 }; \
+                 try { JSON.parse('[0,0]', function () { this[1] = o; }); } catch (e) { r.push(e.name); } \
+                 r.join('|')"
+            ),
+            "6|u|1|4294967294|b|u|4294967295|z|b|u|RangeError|RangeError"
         );
     }
 }

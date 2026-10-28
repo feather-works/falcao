@@ -25,10 +25,39 @@ fn endereco_pilha() -> usize {
     std::hint::black_box(&x) as *const u8 as usize
 }
 
+/// Chamadas a partir das quais o N2 compila a função (os laços compilam pelo calor das voltas).
+const LIMITE_JIT: u32 = 500;
+
+/// Como o código do N2 terminou ([`Motor::rodar_jit`]).
+enum SaidaJit {
+    /// O intérprete segue em `pc` com o acumulador.
+    Segue(usize, Valor),
+    /// `Retorna` em `pc` com o valor no acumulador.
+    Retorno(usize, Valor),
+    /// Uma chamada aninhada saiu para o N1: o quadro do topo já está pronto (acumulador em
+    /// `Motor::jit_acc`, erro em `Motor::jit_erro`).
+    Aborto,
+}
+
 /// Sem gerador/async ligado ao quadro.
 pub const SEM_SUSPENSO: u32 = u32::MAX;
 
+/// O quadro de um callback chamado várias vezes por uma nativa ([`Motor::repetidor`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Repetidor {
+    qi: usize,
+    marca: u32,
+    base: u32,
+    fim: u32,
+    n: u32,
+    np: u32,
+    proto: u32,
+    endereco: u64,
+}
+
+/// `repr(C)`: o N2 empurra e lê quadros direto ([`crate::jit`] confere os deslocamentos).
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct Quadro {
     pub proto: u32,
     pub pc: u32,
@@ -278,8 +307,8 @@ impl Motor {
     /// Empurra o quadro de uma função de bytecode. `args` aponta para a pilha.
     fn empurrar_quadro(&mut self, f: Valor, this: Valor, args: Args, nt: Valor, construindo: bool) -> Res<()> {
         let proto = self.interno(f, F_CODIGO);
-        let fb = self.protos[proto as usize].codigo();
-        let (np, nregs, fl) = (fb.parametros, fb.registradores, fb.flags);
+        let p = &self.protos[proto as usize];
+        let (np, nregs, fl) = (p.parametros, p.registradores, p.flags);
         if self.quadros.len() > 10_000 {
             return self.erro_alcance("Maximum call stack size exceeded");
         }
@@ -294,9 +323,24 @@ impl Motor {
         } else {
             this
         };
+        self.empilhar(f, proto, np, nregs, this, args, nt, construindo);
+        Ok(())
+    }
+
+    /// Empurra o quadro de `f` (bytecode `proto`) com o `this` já pronto.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn empilhar(&mut self, f: Valor, proto: u32, np: u32, nregs: u32, this: Valor, args: Args, nt: Valor, construindo: bool) {
         let topo = self.pilha.len() as u32;
         let (base, args_q) = if args.n <= np {
-            self.pilha.extend_from_within(args.base as usize..(args.base + args.n) as usize);
+            // O caso comum: os argumentos e o resto dos registradores (undefined) de uma vez.
+            let fim = topo + nregs.max(np);
+            self.pilha.reserve((fim - topo) as usize);
+            for i in 0..args.n {
+                let v = self.pilha[(args.base + i) as usize];
+                self.pilha.push(v);
+            }
+            self.pilha.extend(std::iter::repeat_n(Valor::UNDEFINED, (fim - topo - args.n) as usize));
             (topo, Args { base: topo, n: args.n })
         } else {
             self.pilha.extend_from_within(args.base as usize..(args.base + args.n) as usize);
@@ -325,7 +369,41 @@ impl Motor {
         });
         let p = &mut self.protos[proto as usize];
         p.chamadas = p.chamadas.saturating_add(1);
-        Ok(())
+    }
+
+    /// O caminho curto do `entrar` para o N2: função de bytecode comum (não classe, não
+    /// gerador, não async) que já tem código, com `this` que não precisa virar objeto. Falso =
+    /// o caminho geral.
+    #[inline]
+    fn jit_empurrar(&mut self, f: Valor, this: Valor, args: Args) -> Option<u32> {
+        if !f.e_ref() || self.quadros.len() > 10_000 {
+            return None;
+        }
+        if self.formas.tipo_classe(self.forma(f)) != [crate::formas::Tipo::Objeto as u8, Classe::Funcao as u8] {
+            return None;
+        }
+        let c = self.interno(f, F_CODIGO);
+        if c & BIT_NATIVA != 0 {
+            return None;
+        }
+        let p = &self.protos[c as usize];
+        let (np, nregs, fl) = (p.parametros, p.registradores, p.flags);
+        if p.jit.is_none() || fl.construtor_classe || fl.assincrona || fl.gerador {
+            return None;
+        }
+        let this = if fl.seta {
+            Valor::UNDEFINED
+        } else if fl.estrita {
+            this
+        } else if this.e_nulo_ou_indefinido() {
+            self.intr.global
+        } else if self.e_objeto(this) {
+            this
+        } else {
+            return None;
+        };
+        self.empilhar(f, c, np, nregs, this, args, Valor::UNDEFINED, false);
+        Some(c)
     }
 
     /// Chama `f`. `Some(v)`: terminou (nativa); `None`: empurrou um quadro de bytecode.
@@ -340,7 +418,7 @@ impl Motor {
                 if c & BIT_NATIVA != 0 {
                     return self.chamar_nativa(c & !BIT_NATIVA, f, this, args, Valor::UNDEFINED).map(Some);
                 }
-                let fl = self.protos[c as usize].codigo().flags;
+                let fl = self.protos[c as usize].flags;
                 if fl.construtor_classe {
                     return self.erro_tipo("Class constructor cannot be invoked without 'new'");
                 }
@@ -535,6 +613,7 @@ impl Motor {
     /// da pilha do Rust, fora da conta dos 10.000 quadros: 1000 cabe numa thread de 2 MB.
     /// Recursão dentro do Rust (Proxy de Proxy, `bind` de `bind`, JSON fundo) não passa pela
     /// pilha de quadros: confere quanto da pilha do Rust já foi usado desde a entrada.
+    #[inline(always)]
     pub(crate) fn checar_pilha(&mut self) -> Res<()> {
         if self.base_pilha != 0 && self.base_pilha.saturating_sub(endereco_pilha()) > self.limite_pilha {
             return self.erro_alcance("Maximum call stack size exceeded");
@@ -545,16 +624,23 @@ impl Motor {
     /// Uma volta de laço longo dentro de nativa (`[].join` com length enorme, `indexOf` em
     /// objeto com length 1e15): olha o `interromper` como `SaltaAtras` (senão o botão Parar
     /// não alcança) e o teto da gaiola (lá dentro o coletor não roda).
-    #[inline]
+    #[inline(always)]
     pub(crate) fn tique(&mut self) -> Res<()> {
         self.voltas = self.voltas.wrapping_add(1);
         if self.voltas & 0xFFFF == 0 {
-            if let Some(motivo) = self.interromper.as_mut().and_then(|f| f()) {
-                return Err(self.erro(crate::intrinsecos::TipoErro::Erro, &motivo));
-            }
-            if !self.g.cabe(0) && !self.terminando {
-                return self.sem_memoria_erro().map(|_| ());
-            }
+            return self.tique_lento();
+        }
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn tique_lento(&mut self) -> Res<()> {
+        if let Some(motivo) = self.interromper.as_mut().and_then(|f| f()) {
+            return Err(self.erro(crate::intrinsecos::TipoErro::Erro, &motivo));
+        }
+        if !self.g.cabe(0) && !self.terminando {
+            return self.sem_memoria_erro().map(|_| ());
         }
         Ok(())
     }
@@ -584,6 +670,7 @@ impl Motor {
         self.somar_int(n, d)
     }
 
+    #[inline(always)]
     fn checar_aninhamento(&mut self) -> Res<()> {
         if self.aninhamento > 1000 {
             return self.erro_alcance("Maximum call stack size exceeded");
@@ -595,7 +682,10 @@ impl Motor {
     pub fn chamar(&mut self, f: Valor, this: Valor, args: &[Valor]) -> Res<Valor> {
         self.checar_aninhamento()?;
         self.aninhamento += 1;
-        let r = self.chamar_externo(f, this, args);
+        let r = match self.jit_chamar_nativa(f, this, args) {
+            Some(r) => r,
+            None => self.chamar_externo(f, this, args),
+        };
         self.aninhamento -= 1;
         r
     }
@@ -623,9 +713,12 @@ impl Motor {
             Ok(Some(v)) => Ok(v),
             Ok(None) => {
                 self.quadros.last_mut().unwrap().entrada = true;
-                match self.laco(Entrada::Normal(Valor::UNDEFINED)) {
-                    Ok(Fim::Retorno(v)) | Ok(Fim::Suspenso(v)) => Ok(v),
-                    Err(e) => Err(e),
+                match self.jit_externo() {
+                    Ok(v) => Ok(v),
+                    Err(ent) => match self.laco(ent) {
+                        Ok(Fim::Retorno(v)) | Ok(Fim::Suspenso(v)) => Ok(v),
+                        Err(e) => Err(e),
+                    },
                 }
             }
             Err(e) => Err(e),
@@ -635,6 +728,286 @@ impl Motor {
             self.base_pilha = 0;
         }
         r
+    }
+
+    /// N2: a chamada de [`Motor::chamar`] (callback de `map`, comparador de `sort`…) a uma função
+    /// de bytecode comum que já tem código: o quadro de entrada empurrado aqui mesmo e o código
+    /// rodado direto (o que `chamar_externo` + `entrar` + `jit_externo` fazem, sem o resto).
+    /// None = o caminho geral.
+    /// N2: a chamada de [`Motor::chamar`] (callback de `map`, comparador de `sort`…) a uma função
+    /// de bytecode comum que já tem código (a entrada dela na tabela da chamada direta): o quadro
+    /// de entrada empurrado aqui mesmo e o código rodado direto, como o `Chama` do código faz.
+    /// None = o caminho geral.
+    #[inline]
+    fn jit_chamar_nativa(&mut self, f: Valor, this: Valor, args: &[Valor]) -> Option<Res<Valor>> {
+        if self.jit_modo == 0 || self.base_pilha == 0 || self.quadros.len() > 10_000 || self.jit_profundidade >= 200 || !f.e_ref() {
+            return None;
+        }
+        if self.formas.tipo_classe(self.forma(f)) != [crate::formas::Tipo::Objeto as u8, Classe::Funcao as u8] {
+            return None;
+        }
+        let c = self.interno(f, F_CODIGO);
+        if c & BIT_NATIVA != 0 {
+            return None;
+        }
+        let e = *self.jit_tabela.get(c as usize)?;
+        if e.endereco == 0 {
+            return None;
+        }
+        let this = match e.modo_this {
+            0 => Valor::UNDEFINED,
+            1 => this,
+            _ if this.e_nulo_ou_indefinido() => self.intr.global,
+            _ if self.e_objeto(this) => this,
+            _ => return None,
+        };
+        if self.checar_pilha().is_err() {
+            return None;
+        }
+        // O quadro como `empilhar`: os argumentos e o resto dos registradores (undefined); com
+        // argumentos a mais, todos eles antes (os do `arguments`) e os registradores depois.
+        let (marca, n, np) = (self.pilha.len() as u32, args.len() as u32, e.parametros);
+        let base = if n <= np { marca } else { marca + n };
+        let fim = base + e.tam;
+        let total = (fim - marca) as usize;
+        let livre = self.pilha.reservar_fim(total);
+        let k = n.min(np) as usize;
+        // SEGURANÇA: `total` lugares reservados: os n argumentos (se há a mais), os k primeiros
+        // e o resto dos `e.tam` registradores, nesta ordem, sem passar do fim.
+        let regs = unsafe {
+            // Poucos itens: laços simples (a cópia de tamanho variável vira `memcpy`).
+            let mut q = livre;
+            if n > np {
+                for (j, &v) in args.iter().enumerate() {
+                    q.add(j).write(v);
+                }
+                q = q.add(n as usize);
+            }
+            for (j, &v) in args[..k].iter().enumerate() {
+                q.add(j).write(v);
+            }
+            for j in k..e.tam as usize {
+                q.add(j).write(Valor::UNDEFINED);
+            }
+            self.pilha.crescer_len(total);
+            q
+        };
+        let contexto = Valor(self.interno(f, F_CONTEXTO));
+        let livre = self.quadros.reservar_fim(1);
+        let quadro = Quadro {
+            proto: c,
+            pc: 0,
+            base,
+            fim,
+            args: Args { base: marca, n },
+            topo: marca,
+            this,
+            funcao: f,
+            new_target: Valor::UNDEFINED,
+            contexto,
+            contextos: 0,
+            entrada: true,
+            construindo: false,
+            suspenso: SEM_SUSPENSO,
+        };
+        // SEGURANÇA: um lugar reservado.
+        unsafe {
+            livre.write(quadro);
+            self.quadros.crescer_len(1);
+        }
+        let qi = self.quadros.len() - 1;
+        if self.jit_profundidade == 0 {
+            self.jit_limite = endereco_pilha().saturating_sub(256 * 1024);
+        }
+        self.jit_profundidade += 1;
+        let (topo, teto) = self.g.ptr_topo_teto();
+        let m: *mut Motor = self;
+        let mut ctx = crate::jit::Contexto {
+            regs,
+            gaiola: self.g.ptr(),
+            pendente: std::ptr::addr_of!(self.g.coleta_pendente),
+            motor: m,
+            acc: Valor::UNDEFINED.0,
+            pc: 0,
+            voltas: 0,
+            motivo: 0,
+            formas: self.formas.ptr(),
+            n_formas: self.formas.len() as u32,
+            classes: self.formas.ptr_tc(),
+            limite: self.jit_limite,
+            caixa: 0,
+            quadro: qi as u32,
+            base,
+            contexto: contexto.0,
+            topo,
+            teto,
+        };
+        // SEGURANÇA: o endereço é de um código vivo (os velhos ficam em `jit_antigos`) com no
+        // máximo `e.tam` registradores, todos empurrados acima; o motor só é usado pelas nativas
+        // do próprio código enquanto ele roda.
+        unsafe { crate::jit::rodar_endereco(e.endereco, &mut ctx) };
+        self.jit_profundidade -= 1;
+        let r = if ctx.motivo == crate::jit::SAIU_RETORNO && ctx.voltas == 0 {
+            // O `Retorna` de um quadro de entrada.
+            self.quadros.pop();
+            Ok(Valor(ctx.acc))
+        } else {
+            self.jit_nativa_resto(qi, &ctx)
+        };
+        self.pilha.truncate(marca as usize);
+        Some(r)
+    }
+
+    /// N2: prepara chamadas repetidas de `f` com `n` argumentos por uma nativa (o callback de
+    /// `forEach`, `map`, `filter`…): confere a função uma vez e deixa o quadro dela empurrado;
+    /// cada [`Motor::repetir`] só reescreve os argumentos e roda o código. Entre uma chamada e
+    /// outra a nativa não pode rodar JS nem lançar com o quadro ali: [`Motor::soltar`] antes.
+    /// None = sem código, ou função que não é comum (o caminho geral, `chamar_coletavel`).
+    pub(crate) fn repetidor(&mut self, f: Valor, this: Valor, n: u32) -> Option<Repetidor> {
+        if self.jit_modo == 0 || self.base_pilha == 0 || self.quadros.len() > 10_000 || self.jit_profundidade >= 200 || !f.e_ref() {
+            return None;
+        }
+        if self.aninhamento > 1000 || self.checar_pilha().is_err() {
+            return None;
+        }
+        if self.formas.tipo_classe(self.forma(f)) != [crate::formas::Tipo::Objeto as u8, Classe::Funcao as u8] {
+            return None;
+        }
+        let c = self.interno(f, F_CODIGO);
+        if c & BIT_NATIVA != 0 {
+            return None;
+        }
+        let e = *self.jit_tabela.get(c as usize)?;
+        if e.endereco == 0 {
+            return None;
+        }
+        let this = match e.modo_this {
+            0 => Valor::UNDEFINED,
+            1 => this,
+            _ if this.e_nulo_ou_indefinido() => self.intr.global,
+            _ if self.e_objeto(this) => this,
+            _ => return None,
+        };
+        // O quadro como `empilhar`, com os argumentos ainda undefined.
+        let marca = self.pilha.len() as u32;
+        let base = if n <= e.parametros { marca } else { marca + n };
+        let fim = base + e.tam;
+        self.pilha.resize(fim as usize, Valor::UNDEFINED);
+        let contexto = Valor(self.interno(f, F_CONTEXTO));
+        self.quadros.push(Quadro {
+            proto: c,
+            pc: 0,
+            base,
+            fim,
+            args: Args { base: marca, n },
+            topo: marca,
+            this,
+            funcao: f,
+            new_target: Valor::UNDEFINED,
+            contexto,
+            contextos: 0,
+            entrada: true,
+            construindo: false,
+            suspenso: SEM_SUSPENSO,
+        });
+        if self.jit_profundidade == 0 {
+            self.jit_limite = endereco_pilha().saturating_sub(256 * 1024);
+        }
+        Some(Repetidor { qi: self.quadros.len() - 1, marca, base, fim, n, np: e.parametros, proto: c, endereco: e.endereco })
+    }
+
+    /// Tira o quadro do [`Motor::repetidor`] (se ainda está lá).
+    pub(crate) fn soltar(&mut self, r: &mut Option<Repetidor>) {
+        if let Some(r) = r.take() {
+            debug_assert_eq!(self.quadros.len(), r.qi + 1);
+            self.quadros.truncate(r.qi);
+            self.pilha.truncate(r.marca as usize);
+        }
+    }
+
+    /// Uma chamada pelo repetidor `r` (`args.len()` = o `n` dele). Se o código não volta pelo
+    /// caminho curto, o quadro segue pelo caminho geral e o repetidor acaba (`r` = None).
+    pub(crate) fn repetir(&mut self, r: &mut Option<Repetidor>, args: &[Valor]) -> Res<Valor> {
+        let rep = r.as_ref().expect("repetidor solto");
+        debug_assert!(self.quadros.len() == rep.qi + 1 && self.pilha.len() == rep.fim as usize && args.len() as u32 == rep.n);
+        // O código pode ter sido trocado (recompilado, ou a função desistiu do N2) lá dentro.
+        if self.jit_tabela.get(rep.proto as usize).map(|e| e.endereco) != Some(rep.endereco) {
+            let (f, this) = (self.quadros[rep.qi].funcao, self.quadros[rep.qi].this);
+            self.soltar(r);
+            return self.chamar_coletavel(f, this, args);
+        }
+        let rep = *rep;
+        // Os argumentos (todos antes, se há a mais que os parâmetros) e o resto undefined: o
+        // código pode ter gravado nos registradores na chamada anterior.
+        let k = rep.n.min(rep.np) as usize;
+        {
+            // Poucos itens: laços simples (a cópia de tamanho variável vira `memcpy`).
+            let p = &mut self.pilha[rep.marca as usize..rep.fim as usize];
+            let (antes, regs) = p.split_at_mut((rep.base - rep.marca) as usize);
+            for (d, &v) in antes.iter_mut().zip(args) {
+                *d = v;
+            }
+            for (j, d) in regs.iter_mut().enumerate() {
+                *d = if j < k { args[j] } else { Valor::UNDEFINED };
+            }
+        }
+        let q = &mut self.quadros[rep.qi];
+        q.pc = 0;
+        let contexto = q.contexto;
+        self.seguro += 2;
+        self.aninhamento += 1;
+        self.jit_profundidade += 1;
+        let (topo, teto) = self.g.ptr_topo_teto();
+        let m: *mut Motor = self;
+        let mut ctx = crate::jit::Contexto {
+            regs: self.pilha[rep.base as usize..].as_mut_ptr(),
+            gaiola: self.g.ptr(),
+            pendente: std::ptr::addr_of!(self.g.coleta_pendente),
+            motor: m,
+            acc: Valor::UNDEFINED.0,
+            pc: 0,
+            voltas: 0,
+            motivo: 0,
+            formas: self.formas.ptr(),
+            n_formas: self.formas.len() as u32,
+            classes: self.formas.ptr_tc(),
+            limite: self.jit_limite,
+            caixa: 0,
+            quadro: rep.qi as u32,
+            base: rep.base,
+            contexto: contexto.0,
+            topo,
+            teto,
+        };
+        // SEGURANÇA: como em `jit_chamar_nativa` (o quadro e os `tam` registradores estão
+        // empurrados, o código é o da tabela).
+        unsafe { crate::jit::rodar_endereco(rep.endereco, &mut ctx) };
+        self.jit_profundidade -= 1;
+        let v = if ctx.motivo == crate::jit::SAIU_RETORNO && ctx.voltas == 0 && self.pilha.len() == rep.fim as usize {
+            Ok(Valor(ctx.acc))
+        } else {
+            *r = None;
+            let v = self.jit_nativa_resto(rep.qi, &ctx);
+            self.pilha.truncate(rep.marca as usize);
+            v
+        };
+        self.aninhamento -= 1;
+        self.seguro -= 2;
+        v
+    }
+
+    /// O código chamado por [`Motor::jit_chamar_nativa`] saiu de outro jeito: o resto do quadro.
+    #[cold]
+    #[inline(never)]
+    fn jit_nativa_resto(&mut self, qi: usize, ctx: &crate::jit::Contexto) -> Res<Valor> {
+        let s = self.jit_motivo(qi, ctx.motivo, ctx.voltas, ctx.pc as usize, Valor(ctx.acc));
+        match self.jit_externo_saida(qi, s) {
+            Ok(v) => Ok(v),
+            Err(ent) => match self.laco(ent) {
+                Ok(Fim::Retorno(v)) | Ok(Fim::Suspenso(v)) => Ok(v),
+                Err(e) => Err(e),
+            },
+        }
     }
 
     /// `new f(...args)` de dentro do motor.
@@ -937,6 +1310,30 @@ impl Motor {
                 };
             }
 
+            // N2: função quente (ou de volta de uma chamada) com código entra nele aqui. Não
+            // reentra onde o código acabou de sair para o N1 (a instrução roda no intérprete).
+            if self.jit_modo != 0 && self.jit_entrada(proto) {
+                let pular = self.jit_pular.take() == Some((qi as u32, pc as u32));
+                if !pular {
+                    if let Some(cod) = self.jit_de(proto, true) {
+                        if cod.entra_em(pc) {
+                            match self.rodar_jit(cod, qi, pc, acc) {
+                                SaidaJit::Segue(p, a) | SaidaJit::Retorno(p, a) => {
+                                    pc = p;
+                                    acc = a;
+                                }
+                                SaidaJit::Aborto => {
+                                    acc = self.jit_acc;
+                                    if let Some(e) = self.jit_erro.take() {
+                                        pendente = Some((e, true));
+                                    }
+                                    continue 'quadro;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let erro: Valor = 'exec: loop {
                 let ini = pc;
                 let mut escala = 1usize;
@@ -1018,6 +1415,33 @@ impl Motor {
                         }
                         if self.sem_memoria(&mut acc) {
                             t!(self.sem_memoria_erro());
+                        }
+                    };
+                }
+                // N2: no começo do laço, o código de máquina da função (se há) roda as próximas
+                // voltas. Função sem código só procura a cada 256 voltas (a amostra do calor).
+                macro_rules! osr {
+                    () => {
+                        if self.jit_modo != 0
+                            && (self.jit_modo == 2 || self.voltas & 0xFF == 0 || self.protos[proto].jit.as_ref().is_some_and(|c| c.entra_em(pc)))
+                        {
+                            if let Some(cod) = self.jit_laco(proto, pc) {
+                                {
+                                    match self.rodar_jit(cod, qi, pc, acc) {
+                                        SaidaJit::Segue(p, a) | SaidaJit::Retorno(p, a) => {
+                                            pc = p;
+                                            acc = a;
+                                        }
+                                        SaidaJit::Aborto => {
+                                            acc = self.jit_acc;
+                                            if let Some(e) = self.jit_erro.take() {
+                                                pendente = Some((e, true));
+                                            }
+                                            continue 'quadro;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     };
                 }
@@ -1107,48 +1531,12 @@ impl Motor {
                     Op::LeGlobal | Op::LeGlobalTypeof => {
                         let (k, ci) = (u!(), u!());
                         let c = nome!(k);
-                        let g = self.intr.global;
-                        let cache = self.protos[proto].caches[ci as usize];
-                        if cache.forma == self.forma(g).0 && cache.forma_dono == self.epoca_lexico {
-                            acc = self.ler_campo(g, cache.deslocamento);
-                        } else {
-                            acc = t!(self.ler_global(c, op == Op::LeGlobalTypeof));
-                            if !self.lexico.contains_key(&c.0) && !self.formas.get(self.forma(g)).dicionario {
-                                if let Some(d) = self.propria(g, c) {
-                                    if d.attrs & attr::ACESSOR == 0 {
-                                        let fg = self.forma(g).0;
-                                        let ep = self.epoca_lexico;
-                                        let cp = &mut self.protos[proto].caches[ci as usize];
-                                        cp.forma = fg;
-                                        cp.deslocamento = d.slot;
-                                        cp.forma_dono = ep;
-                                    }
-                                }
-                            }
-                        }
+                        acc = t!(self.ler_global_cache(proto, ci, c, op == Op::LeGlobalTypeof));
                     }
                     Op::GravaGlobal => {
                         let (k, ci) = (u!(), u!());
                         let c = nome!(k);
-                        let g = self.intr.global;
-                        let cache = self.protos[proto].caches[ci as usize];
-                        if cache.forma == self.forma(g).0 && cache.forma_dono == self.epoca_lexico {
-                            self.gravar_campo(g, cache.deslocamento, acc);
-                        } else {
-                            t!(self.gravar_global(c, acc, estrito));
-                            if !self.lexico.contains_key(&c.0) && !self.formas.get(self.forma(g)).dicionario {
-                                if let Some(d) = self.propria(g, c) {
-                                    if d.attrs & (attr::ACESSOR | attr::GRAVAVEL) == attr::GRAVAVEL {
-                                        let fg = self.forma(g).0;
-                                        let ep = self.epoca_lexico;
-                                        let cp = &mut self.protos[proto].caches[ci as usize];
-                                        cp.forma = fg;
-                                        cp.deslocamento = d.slot;
-                                        cp.forma_dono = ep;
-                                    }
-                                }
-                            }
-                        }
+                        t!(self.gravar_global_cache(proto, ci, c, acc, estrito));
                     }
                     Op::DeclaraGlobal => {
                         let (k, n) = (u!(), u!());
@@ -1278,39 +1666,12 @@ impl Motor {
                     Op::LeItem => {
                         let (r, _ci) = (u!(), u!());
                         let o = reg!(r);
-                        if acc.e_int() && acc.como_int() >= 0 && self.e_objeto(o) {
-                            if let Some(v) = self.elemento(o, acc.como_int() as u32) {
-                                acc = v;
-                                continue 'exec;
-                            }
-                            if self.formas.get(self.forma(o)).classe == Classe::ArrayTipado {
-                                acc = self.tipado_ler(o, acc.como_int() as u32).unwrap_or(Valor::UNDEFINED);
-                                continue 'exec;
-                            }
-                        }
-                        let k = t!(self.para_chave(acc));
-                        acc = t!(self.obter(o, k));
+                        acc = t!(self.op_le_item(o, acc));
                     }
                     Op::GravaItem => {
                         let (r0, r1, _ci) = (u!(), u!(), u!());
                         let (o, kv) = (reg!(r0), reg!(r1));
-                        if kv.e_int() && kv.como_int() >= 0 && self.e_objeto(o) {
-                            let i = kv.como_int() as u32;
-                            let classe = self.formas.get(self.forma(o)).classe;
-                            if classe == Classe::ArrayTipado {
-                                t!(self.tipado_gravar(o, i, acc));
-                                continue 'exec;
-                            }
-                            // Item que já está na lista é comum (os especiais saem dela); item novo só sem índices especiais.
-                            let existe = self.elemento(o, i).is_some();
-                            if matches!(classe, Classe::Array | Classe::Comum | Classe::Argumentos) && (existe || (!self.indices_especiais && (self.proto_de(o) == self.intr.array_proto || self.proto_de(o) == self.intr.objeto_proto))) {
-                                if self.gravar_elemento(o, i, acc) {
-                                    continue 'exec;
-                                }
-                            }
-                        }
-                        let k = t!(self.para_chave(kv));
-                        t!(self.gravar(o, k, acc, estrito));
+                        t!(self.op_grava_item(o, kv, acc, estrito));
                     }
                     Op::ApagaProp => {
                         let (r, k) = (u!(), u!());
@@ -1384,13 +1745,7 @@ impl Motor {
                     // ---- literais ----
                     Op::CriaObjeto => {
                         let n = u!();
-                        let f = if n <= 4 {
-                            self.intr.forma_objeto
-                        } else {
-                            let op = self.intr.objeto_proto;
-                            self.forma_para(Classe::Comum, op, n.min(64))
-                        };
-                        acc = self.novo_objeto(f);
+                        acc = self.op_cria_objeto(n);
                     }
                     Op::CriaArray => {
                         let _ = u!();
@@ -1398,25 +1753,9 @@ impl Motor {
                         acc = self.novo_objeto(f);
                     }
                     Op::DefProp => {
-                        // Cache de transição do objeto literal: forma de antes (`forma`), forma
-                        // depois (`forma_dono`) e o slot do campo novo.
                         let (r, k, ci) = (u!(), u!(), u!());
                         let (o, c) = (reg!(r), nome!(k));
-                        let antes = self.forma(o).0;
-                        let e = self.protos[proto].caches[ci as usize];
-                        if e.forma == antes {
-                            self.g.por_u32(o.deslocamento(), e.forma_dono);
-                            self.gravar_campo(o, e.deslocamento, acc);
-                        } else {
-                            self.definir_propria(o, c, acc, attr::PADRAO);
-                            let depois = self.forma(o);
-                            if depois.0 != antes && !self.formas.get(depois).dicionario {
-                                if let Some(d) = self.formas.procurar(depois, c) {
-                                    let e = &mut self.protos[proto].caches[ci as usize];
-                                    (e.forma, e.forma_dono, e.deslocamento) = (antes, depois.0, d.slot);
-                                }
-                            }
-                        }
+                        self.op_def_prop(proto, ci, o, c, acc);
                     }
                     Op::DefItem => {
                         let (r0, r1) = (u!(), u!());
@@ -1428,8 +1767,7 @@ impl Motor {
                     }
                     Op::Empurra => {
                         let a = reg!(u!());
-                        let n = self.array_len(a);
-                        self.gravar_elemento(a, n, acc);
+                        self.op_empurra(a, acc);
                     }
                     Op::EmpurraBuraco => {
                         let a = reg!(u!());
@@ -1491,28 +1829,7 @@ impl Motor {
                     }
                     Op::CriaFuncao => {
                         let k = u!();
-                        let ConstRt::Funcao(p) = self.protos[proto].consts[k as usize] else { panic!("CriaFuncao sem função") };
-                        let q = self.quadros[qi];
-                        let mut this = if fb.flags.seta { Valor(self.interno(q.funcao, F_THIS)) } else { q.this };
-                        if fb.flags.construtor_classe && fb.flags.classe_derivada && !self.celula_this(this) && self.protos[p as usize].codigo().flags.seta {
-                            // Seta no construtor derivado: o `this` (e o `super()`) fica numa célula
-                            // [this, construtor, new.target] dividida com o construtor.
-                            let c = self.nova_lista(3);
-                            self.lista_set(c, 0, this);
-                            self.lista_set(c, 1, q.funcao);
-                            self.lista_set(c, 2, q.new_target);
-                            self.quadros[qi].this = c;
-                            this = c;
-                        }
-                        let f = self.closure(p, q.contexto, this, None);
-                        if fb.flags.seta || self.protos[p as usize].codigo().flags.seta {
-                            // A seta herda a casa (super) de quem a cria.
-                            let casa = Valor(self.interno(q.funcao, F_CASA));
-                            if q.funcao != Valor::UNDEFINED && casa != Valor::UNDEFINED {
-                                self.por_interno_valor(f, F_CASA, casa);
-                            }
-                        }
-                        acc = f;
+                        acc = self.op_cria_funcao(qi, proto, k);
                     }
                     Op::CriaClasse => {
                         let (k, rh) = (u!(), u!());
@@ -1689,6 +2006,7 @@ impl Motor {
                                 if codigo.get(pc) == Some(&(Op::SaltaAtras as u8)) {
                                     pc = i32::from_le_bytes(codigo[pc + 1..pc + 5].try_into().unwrap()) as u32 as usize;
                                     volta!();
+                                    osr!();
                                 }
                                 continue 'exec;
                             }
@@ -1725,6 +2043,7 @@ impl Motor {
                     Op::SaltaAtras => {
                         pc = i4!() as u32 as usize;
                         volta!();
+                        osr!();
                     }
                     Op::SaltaSeVerdadeiro | Op::SaltaSeFalso => {
                         let a = i4!() as u32 as usize;
@@ -1990,8 +2309,10 @@ impl Motor {
                         self.por_interno_valor(gen, 2, f);
                         if assinc {
                             // Gerador async: a fila de pedidos (e o estado) no campo 1.
-                            let fila = self.nova_lista(1);
-                            self.lista_set(fila, 0, Valor::int(crate::builtins::assincronos::AG_INICIO));
+                            use crate::builtins::assincronos::{AG_CAB, AG_INICIO};
+                            let fila = self.nova_lista(AG_CAB);
+                            self.lista_set(fila, 0, Valor::int(AG_INICIO));
+                            self.lista_set(fila, 1, Valor::int(AG_CAB as i32));
                             self.por_interno_valor(gen, 1, fila);
                         }
                         let entrada = self.quadros[qi].entrada;
@@ -2414,6 +2735,719 @@ impl Motor {
         !self.g.cabe(0)
     }
 
+    /// N2: o código da função `proto`, compilando se ainda não tentou e `quente` (ou o modo
+    /// pede tudo).
+    fn jit_de(&mut self, proto: usize, quente: bool) -> Option<Rc<crate::jit::CodigoJit>> {
+        let p = &self.protos[proto];
+        if p.jit.is_some() || p.jit_tentou || !(quente || self.jit_modo == 2) {
+            return p.jit.clone();
+        }
+        let c = crate::jit::compilar(self, proto).map(Rc::new);
+        self.protos[proto].jit_tentou = true;
+        self.jit_por(proto, c.clone());
+        c
+    }
+
+    /// Troca o código do N2 da função `proto` (e a entrada dela na tabela da chamada direta).
+    /// O código velho não é liberado: pode estar rodando mais abaixo na pilha de máquina.
+    fn jit_por(&mut self, proto: usize, cod: Option<Rc<crate::jit::CodigoJit>>) {
+        if let Some(velho) = self.protos[proto].jit.take() {
+            self.jit_antigos.push(velho);
+        }
+        let p = &self.protos[proto];
+        let fl = p.flags;
+        let tam = p.registradores.max(p.parametros);
+        let e = match &cod {
+            Some(c) if !(fl.construtor_classe || fl.assincrona || fl.gerador) && c.regs <= tam => crate::jit::EntradaJit {
+                endereco: c.endereco() as u64,
+                tam,
+                parametros: p.parametros,
+                modo_this: if fl.seta { 0 } else if fl.estrita { 1 } else { 2 },
+                _livre: 0,
+            },
+            _ => crate::jit::EntradaJit::default(),
+        };
+        if self.jit_tabela.len() <= proto {
+            self.jit_tabela.resize(proto + 1, crate::jit::EntradaJit::default());
+        }
+        self.jit_tabela[proto] = e;
+        self.protos[proto].jit = cod;
+    }
+
+    /// N2: a função chamada por uma nativa (callback de `map`, comparador de `sort`…) roda no
+    /// código dela direto, sem passar pelo laço do intérprete. `Err` = como o laço deve continuar
+    /// o quadro do topo (o código saiu para o N1, ou não há código).
+    fn jit_externo(&mut self) -> Result<Valor, Entrada> {
+        let topo = self.quadros.len() - 1;
+        let proto = self.quadros[topo].proto as usize;
+        if self.jit_modo == 0 || !self.jit_entrada(proto) {
+            return Err(Entrada::Normal(Valor::UNDEFINED));
+        }
+        let Some(cod) = self.jit_de(proto, true) else { return Err(Entrada::Normal(Valor::UNDEFINED)) };
+        let s = self.rodar_jit(cod, topo, 0, Valor::UNDEFINED);
+        self.jit_externo_saida(topo, s)
+    }
+
+    /// O que [`Motor::jit_externo`] faz depois de rodar o código do quadro de entrada `topo`.
+    fn jit_externo_saida(&mut self, topo: usize, s: SaidaJit) -> Result<Valor, Entrada> {
+        match s {
+            SaidaJit::Retorno(pc, v) => {
+                let q = self.quadros[topo];
+                if q.construindo {
+                    self.quadros[topo].pc = pc as u32;
+                    self.jit_pular = Some((topo as u32, pc as u32));
+                    return Err(Entrada::Normal(v));
+                }
+                // O `Retorna` de um quadro de entrada.
+                self.quadros.pop();
+                self.pilha.truncate(q.topo as usize);
+                Ok(v)
+            }
+            SaidaJit::Segue(pc, v) => {
+                let t = self.quadros.len() - 1;
+                self.quadros[t].pc = pc as u32;
+                self.jit_pular = Some((t as u32, pc as u32));
+                Err(Entrada::Normal(v))
+            }
+            SaidaJit::Aborto => match self.jit_erro.take() {
+                // O laço lança do `pc` anterior ao guardado (o de depois da instrução).
+                Some(e) => {
+                    let t = self.quadros.len() - 1;
+                    self.quadros[t].pc += 1;
+                    Err(Entrada::Lanca(e))
+                }
+                None => Err(Entrada::Normal(self.jit_acc)),
+            },
+        }
+    }
+
+    /// N2: entra no código da função pelo começo ou na volta de uma chamada? Só se ele já existe
+    /// ou a função ficou quente, e se o código não vive saindo para o N1.
+    #[inline(always)]
+    fn jit_entrada(&self, proto: usize) -> bool {
+        let p = &self.protos[proto];
+        (p.jit.is_some() || (!p.jit_tentou && (p.chamadas >= LIMITE_JIT || self.jit_modo == 2))) && p.jit_n1 < 1000
+    }
+
+    /// N2, no salto para trás que volta a `pc`: o código da função se ele entra ali. Laço quente
+    /// que ficou de fora (o cache dele estava vazio quando a função compilou) recompila a função,
+    /// poucas vezes.
+    #[cold]
+    #[inline(never)]
+    fn jit_laco(&mut self, proto: usize, pc: usize) -> Option<Rc<crate::jit::CodigoJit>> {
+        let quente = self.voltas & 0xFF == 0;
+        let cod = self.jit_de(proto, quente)?;
+        if cod.entra_em(pc) {
+            return Some(cod);
+        }
+        let p = &mut self.protos[proto];
+        if !quente || p.jit_recompilou >= 4 {
+            return None;
+        }
+        p.jit_recompilou += 1;
+        p.jit_tentou = false;
+        self.jit_por(proto, None);
+        self.jit_de(proto, true).filter(|c| c.entra_em(pc))
+    }
+
+    /// N2: roda o código `cod` do quadro `qi` a partir de `pc` (uma entrada). Entre lotes de
+    /// voltas faz o que o `volta!` faz: calor, interrupção, coleta, memória.
+    fn rodar_jit(&mut self, mut cod: Rc<crate::jit::CodigoJit>, qi: usize, mut pc: usize, mut acc: Valor) -> SaidaJit {
+        let (proto, base) = (self.quadros[qi].proto as usize, self.quadros[qi].base as usize);
+        // O código lê e grava os registradores direto: todos têm de existir. E a pilha de
+        // máquina: cada código aninhado é um quadro nativo a mais.
+        if base + cod.regs as usize > self.pilha.len() || self.jit_profundidade >= 200 {
+            return SaidaJit::Segue(pc, acc);
+        }
+        if self.jit_profundidade == 0 {
+            // Até 256 KB de pilha de máquina para os códigos chamados direto, a partir daqui.
+            self.jit_limite = endereco_pilha().saturating_sub(256 * 1024);
+        }
+        self.jit_profundidade += 1;
+        let (topo, teto) = self.g.ptr_topo_teto();
+        let r = loop {
+            let m: *mut Motor = self;
+            let mut ctx = crate::jit::Contexto {
+                regs: self.pilha[base..].as_mut_ptr(),
+                gaiola: self.g.ptr(),
+                pendente: std::ptr::addr_of!(self.g.coleta_pendente),
+                motor: m,
+                acc: acc.0,
+                pc: pc as u32,
+                voltas: 0,
+                motivo: 0,
+                formas: self.formas.ptr(),
+                n_formas: self.formas.len() as u32,
+                classes: self.formas.ptr_tc(),
+                limite: self.jit_limite,
+                caixa: 0,
+                quadro: qi as u32,
+                base: base as u32,
+                contexto: self.quadros[qi].contexto.0,
+                topo,
+                teto,
+            };
+            // SEGURANÇA: `regs` tem `cod.regs` registradores (conferido acima; as nativas que o
+            // código chama renovam os ponteiros), `pc` é uma entrada, e o motor só é usado pelas
+            // nativas do próprio código enquanto ele roda.
+            unsafe { cod.rodar(&mut ctx) };
+            acc = Valor(ctx.acc);
+            pc = ctx.pc as usize;
+            if let Some(s) = self.jit_voltas(proto, qi, pc, ctx.voltas) {
+                break s;
+            }
+            match ctx.motivo {
+                crate::jit::SAIU_LOTE => {
+                    if self.g.coleta_pendente && self.pode_coletar() {
+                        self.quadros[qi].pc = pc as u32;
+                        acc = self.ponto_seguro(acc);
+                    }
+                    if self.sem_memoria(&mut acc) {
+                        let e = self.sem_memoria_erro().unwrap_err();
+                        break self.jit_erro_em(qi, pc, e);
+                    }
+                    if !cod.entra_em(pc) {
+                        break SaidaJit::Segue(pc, acc);
+                    }
+                    // Cache de propriedade que estava vazio ao compilar já aprendeu: recompila
+                    // (poucas vezes) para o caminho rápido dele entrar no código.
+                    if cod.frio(self) && self.protos[proto].jit_recompilou < 4 {
+                        let p = &mut self.protos[proto];
+                        p.jit_recompilou += 1;
+                        p.jit_tentou = false;
+                        self.jit_por(proto, None);
+                        match self.jit_de(proto, true) {
+                            Some(novo) if novo.entra_em(pc) => cod = novo,
+                            _ => break SaidaJit::Segue(pc, acc),
+                        }
+                    }
+                }
+                crate::jit::SAIU_GUARDA => {
+                    let p = &mut self.protos[proto];
+                    p.jit_falhas += 1;
+                    if p.jit_falhas >= crate::jit::MAX_FALHAS {
+                        self.jit_por(proto, None);
+                    }
+                    break SaidaJit::Segue(pc, acc);
+                }
+                crate::jit::SAIU_RETORNO => break SaidaJit::Retorno(pc, acc),
+                crate::jit::SAIU_ABORTO => break SaidaJit::Aborto,
+                _ => {
+                    let p = &mut self.protos[proto];
+                    p.jit_n1 = p.jit_n1.saturating_add(1);
+                    break SaidaJit::Segue(pc, acc);
+                }
+            }
+        };
+        self.jit_profundidade -= 1;
+        r
+    }
+
+    /// As voltas que o código fez (o que o `volta!` conta: calor e o `interromper`). Some = o
+    /// script foi interrompido.
+    fn jit_voltas(&mut self, proto: usize, qi: usize, pc: usize, n: u32) -> Option<SaidaJit> {
+        if n == 0 {
+            return None;
+        }
+        let antes = self.voltas;
+        self.voltas = antes.wrapping_add(n);
+        let amostras = (self.voltas >> 8).wrapping_sub(antes >> 8);
+        let p = &mut self.protos[proto];
+        p.voltas = p.voltas.saturating_add(amostras.saturating_mul(256));
+        if (self.voltas >> 16) != (antes >> 16) {
+            if let Some(motivo) = self.interromper.as_mut().and_then(|f| f()) {
+                let e = self.erro(crate::intrinsecos::TipoErro::Erro, &motivo);
+                return Some(self.jit_erro_em(qi, pc, e));
+            }
+        }
+        None
+    }
+
+    /// O código chamado direto saiu de outro jeito (lote de voltas, guarda, instrução que o N2
+    /// não sabe, erro): o mesmo que [`Motor::jit_chamar`] faz depois de rodar o código.
+    pub(crate) fn jit_continuar_direto(&mut self, qi: usize, topo: usize, motivo: u32, voltas: u32, pc: usize, acc: Valor) -> Option<Valor> {
+        let saida = self.jit_motivo(topo, motivo, voltas, pc, acc);
+        self.jit_fim_chamada(qi, topo, saida)
+    }
+
+    /// O código do quadro `topo` saiu com `motivo` (o que `rodar_jit` faz depois de cada lote).
+    fn jit_motivo(&mut self, topo: usize, motivo: u32, voltas: u32, pc: usize, acc: Valor) -> SaidaJit {
+        let proto = self.quadros[topo].proto as usize;
+        match self.jit_voltas(proto, topo, pc, voltas) {
+            Some(s) => s,
+            None => match motivo {
+                crate::jit::SAIU_LOTE => match self.protos[proto].jit.clone() {
+                    Some(cod) if cod.entra_em(pc) => self.rodar_jit(cod, topo, pc, acc),
+                    _ => SaidaJit::Segue(pc, acc),
+                },
+                crate::jit::SAIU_GUARDA => {
+                    let p = &mut self.protos[proto];
+                    p.jit_falhas += 1;
+                    if p.jit_falhas >= crate::jit::MAX_FALHAS {
+                        self.jit_por(proto, None);
+                    }
+                    SaidaJit::Segue(pc, acc)
+                }
+                crate::jit::SAIU_RETORNO => SaidaJit::Retorno(pc, acc),
+                crate::jit::SAIU_ABORTO => SaidaJit::Aborto,
+                _ => {
+                    let p = &mut self.protos[proto];
+                    p.jit_n1 = p.jit_n1.saturating_add(1);
+                    SaidaJit::Segue(pc, acc)
+                }
+            },
+        }
+    }
+
+    /// Depois do código da função chamada (quadro `topo`) rodar: o valor de volta, ou None =
+    /// desistir (o intérprete continua do quadro do topo).
+    fn jit_fim_chamada(&mut self, qi: usize, topo: usize, saida: SaidaJit) -> Option<Valor> {
+        match saida {
+            SaidaJit::Retorno(pc, v) => {
+                let q = &self.quadros[topo];
+                if q.construindo || q.entrada {
+                    self.jit_abortar_em(topo, pc, v);
+                    return None;
+                }
+                // O `Retorna` do intérprete, sem construtor nem entrada.
+                self.quadros.pop();
+                let fim = self.quadros[qi].fim;
+                self.pilha.truncate(fim as usize);
+                Some(v)
+            }
+            SaidaJit::Segue(pc, v) => {
+                self.jit_abortar_em(topo, pc, v);
+                None
+            }
+            SaidaJit::Aborto => None,
+        }
+    }
+
+    /// Erro no quadro `qi` em `pc`: o intérprete lança dali (pela saída [`SaidaJit::Aborto`]).
+    fn jit_erro_em(&mut self, qi: usize, pc: usize, e: Valor) -> SaidaJit {
+        self.quadros[qi].pc = pc as u32;
+        self.reanotar_erro(e, qi, pc);
+        self.jit_erro = Some(e);
+        SaidaJit::Aborto
+    }
+
+    /// O código do quadro `qi` aninhado saiu para o N1 em `pc`: os de baixo desistem e o
+    /// intérprete continua deste, sem voltar ao código antes de rodar a instrução.
+    fn jit_abortar_em(&mut self, qi: usize, pc: usize, acc: Valor) {
+        self.quadros[qi].pc = pc as u32;
+        self.jit_acc = acc;
+        self.jit_pular = Some((qi as u32, pc as u32));
+    }
+
+    /// `Chama rf, rt, n` do código do quadro `qi`. Função de bytecode com código roda aninhada;
+    /// None = desistir (o intérprete continua do quadro do topo; erro em `jit_erro`).
+    pub(crate) fn jit_chamar(&mut self, qi: usize, rf: u32, rt: u32, n: u32, ini: usize, prox: usize) -> Option<Valor> {
+        // O mesmo que o intérprete faz antes de chamar (`salvar_pc!`); e o ponto seguro dele nas
+        // chamadas: o acumulador do chamador não está vivo, os registradores estão na pilha.
+        self.quadros[qi].pc = prox as u32;
+        if self.g.coleta_pendente && self.pode_coletar() {
+            self.ponto_seguro(Valor::UNDEFINED);
+        }
+        let base = self.quadros[qi].base;
+        let (f, this) = (self.pilha[(base + rf) as usize], self.pilha[(base + rt) as usize]);
+        let args = Args { base: base + rt + 1, n };
+        let cod = match self.jit_empurrar(f, this, args) {
+            // Função com código: o quadro já está empurrado.
+            Some(p) => self.protos[p as usize].jit.clone(),
+            None => {
+                let r = match self.entrar(f, this, args) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let fim = self.quadros[qi].fim;
+                        self.pilha.truncate(fim as usize);
+                        self.jit_erro_em(qi, ini, e);
+                        return None;
+                    }
+                };
+                if r.is_some() {
+                    return r;
+                }
+                let proto = self.quadros[self.quadros.len() - 1].proto as usize;
+                if self.jit_entrada(proto) {
+                    self.jit_de(proto, true)
+                } else {
+                    None
+                }
+            }
+        };
+        let topo = self.quadros.len() - 1;
+        let Some(cod) = cod else {
+            // Sem código: o intérprete roda a função chamada desde o começo.
+            self.jit_acc = Valor::UNDEFINED;
+            self.jit_pular = None;
+            return None;
+        };
+        let saida = self.rodar_jit(cod, topo, 0, Valor::UNDEFINED);
+        self.jit_fim_chamada(qi, topo, saida)
+    }
+
+    /// [`Motor::anotar`] do código do quadro `qi`: soma `a + b` que saiu dos inteiros.
+    pub(crate) fn jit_anotar(&mut self, qi: usize, c: u32, a: Valor, b: Valor) {
+        let proto = self.quadros[qi].proto as usize;
+        if self.protos[proto].tipos[c as usize] < tipo::ESTAVEL {
+            // O resultado não é inteiro (por isso o caminho lento): `estourou` se eram dois.
+            self.anotar(proto, c, a, b, Valor::UNDEFINED);
+        }
+    }
+
+    /// O caminho geral de uma instrução do código do quadro `qi` (o caminho rápido dela, quando
+    /// há, já ficou no código): o mesmo que o intérprete faz, com o acumulador `acc` e os
+    /// operandos `a`, `b`, `c`. Devolve o novo acumulador; None = erro (em `jit_erro`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn jit_instrucao(&mut self, qi: usize, op: Op, a: u32, b: u32, c: u32, ini: usize, acc: Valor) -> Option<Valor> {
+        let proto = self.quadros[qi].proto as usize;
+        let base = self.quadros[qi].base as usize;
+        let reg = |m: &Motor, r: u32| m.pilha[base + r as usize];
+        let nome = |m: &Motor, k: u32| match m.protos[proto].consts[k as usize] {
+            ConstRt::Nome(c) => c,
+            _ => panic!("constante não é nome"),
+        };
+        let estrito = |m: &Motor| m.protos[proto].codigo().flags.estrita;
+        let r: Res<Valor> = (|| match op {
+            Op::LeGlobal => {
+                let c = nome(self, a);
+                self.ler_global_cache(proto, b, c, false)
+            }
+            Op::GravaGlobal => {
+                let c = nome(self, a);
+                self.gravar_global_cache(proto, b, c, acc, estrito(self)).map(|_| acc)
+            }
+            Op::LeContexto | Op::LeContextoChecado => {
+                let ctx = self.ctx_subir(self.quadros[qi].contexto, a);
+                let v = self.ctx_ler(ctx, b);
+                if v == Valor::BURACO && op == Op::LeContextoChecado {
+                    self.erro_referencia("Cannot access variable before initialization")
+                } else {
+                    Ok(v)
+                }
+            }
+            Op::GravaContexto => {
+                let ctx = self.ctx_subir(self.quadros[qi].contexto, a);
+                self.ctx_gravar(ctx, b, acc);
+                Ok(acc)
+            }
+            Op::Soma => {
+                let x = reg(self, a);
+                let v = self.somar(x, acc)?;
+                self.jit_perfil(proto, b, x, acc, v);
+                Ok(v)
+            }
+            Op::Sub | Op::Mul | Op::Div | Op::Resto | Op::Potencia => {
+                let ar = match op {
+                    Op::Sub => Arit::Sub,
+                    Op::Mul => Arit::Mul,
+                    Op::Div => Arit::Div,
+                    Op::Resto => Arit::Resto,
+                    _ => Arit::Potencia,
+                };
+                let x = reg(self, a);
+                let v = self.aritmetica(ar, x, acc)?;
+                self.jit_perfil(proto, b, x, acc, v);
+                Ok(v)
+            }
+            Op::E | Op::Ou | Op::OuExclusivo | Op::DeslEsq | Op::DeslDir | Op::DeslDirSemSinal => {
+                let bt = match op {
+                    Op::E => Bits::E,
+                    Op::Ou => Bits::Ou,
+                    Op::OuExclusivo => Bits::Xor,
+                    Op::DeslEsq => Bits::Esq,
+                    Op::DeslDir => Bits::Dir,
+                    _ => Bits::DirSemSinal,
+                };
+                let x = reg(self, a);
+                let v = self.bits(bt, x, acc)?;
+                self.jit_perfil(proto, b, x, acc, v);
+                Ok(v)
+            }
+            Op::SomaInt => {
+                let v = self.somar_int(acc, a as i32)?;
+                if !(acc.e_int() && v.e_int()) {
+                    self.jit_perfil(proto, b, acc, acc, v);
+                }
+                Ok(v)
+            }
+            Op::Igual | Op::Diferente => {
+                let x = reg(self, a);
+                self.jit_perfil(proto, b, x, acc, Valor::int(0));
+                let i = self.iguais(x, acc)?;
+                Ok(Valor::bool(i == (op == Op::Igual)))
+            }
+            Op::Identico | Op::NaoIdentico => {
+                let x = reg(self, a);
+                let i = self.identicos(x, acc);
+                Ok(Valor::bool(i == (op == Op::Identico)))
+            }
+            Op::Menor | Op::Maior | Op::MenorIgual | Op::MaiorIgual => {
+                let x = reg(self, a);
+                self.jit_perfil(proto, b, x, acc, Valor::int(0));
+                Ok(Valor::bool(match op {
+                    Op::Menor => self.menor(x, acc, true)? == Some(true),
+                    Op::Maior => self.menor(acc, x, false)? == Some(true),
+                    Op::MenorIgual => self.menor(acc, x, false)? == Some(false),
+                    _ => self.menor(x, acc, true)? == Some(false),
+                }))
+            }
+            // Os saltos condicionais: o booleano do acumulador (que fica como está).
+            Op::SaltaSeFalso | Op::SaltaSeVerdadeiro | Op::Nao => {
+                let v = self.verdadeiro(acc);
+                Ok(Valor::bool(if op == Op::Nao { !v } else { v }))
+            }
+            Op::Incrementa | Op::Decrementa => {
+                let v = self.mais_um(acc, op == Op::Incrementa)?;
+                if !(acc.e_int() && v.e_int()) {
+                    self.jit_perfil(proto, a, acc, acc, v);
+                }
+                Ok(v)
+            }
+            Op::IncrementaReg | Op::DecrementaReg => {
+                let x = reg(self, a);
+                let v = if x.e_int() { x } else { self.para_numerico(x)? };
+                let n = self.mais_um(v, op == Op::IncrementaReg)?;
+                self.pilha[base + a as usize] = n;
+                if !(x.e_int() && n.e_int()) {
+                    self.jit_perfil(proto, b, x, x, n);
+                }
+                Ok(acc)
+            }
+            Op::ParaNumerico => {
+                if acc.e_int() {
+                    Ok(acc)
+                } else {
+                    self.para_numerico(acc)
+                }
+            }
+            Op::ParaInt32 => {
+                if acc.e_int() {
+                    Ok(acc)
+                } else if self.e_numero(acc) {
+                    let x = crate::numeros::para_int32(self.f64_de(acc));
+                    Ok(self.numero(f64::from(x)))
+                } else {
+                    let v = self.bits(Bits::Ou, acc, Valor::int(0))?;
+                    self.jit_perfil(proto, a, acc, acc, v);
+                    Ok(v)
+                }
+            }
+            Op::LeProp => {
+                let o = reg(self, a);
+                let c_ = nome(self, b);
+                self.ler_prop_cache(proto, c, o, c_)
+            }
+            Op::LePropAcc => {
+                let c_ = nome(self, a);
+                self.ler_prop_cache(proto, b, acc, c_)
+            }
+            Op::GravaProp => {
+                let o = reg(self, a);
+                let c_ = nome(self, b);
+                let e = estrito(self);
+                self.gravar_prop_cache(proto, c, o, c_, acc, e).map(|_| acc)
+            }
+            Op::LeItem => {
+                let o = reg(self, a);
+                self.op_le_item(o, acc)
+            }
+            Op::GravaItem => {
+                let (o, kv) = (reg(self, a), reg(self, b));
+                let e = estrito(self);
+                self.op_grava_item(o, kv, acc, e).map(|_| acc)
+            }
+            Op::CriaObjeto => Ok(self.op_cria_objeto(a)),
+            Op::CriaArray => {
+                let f = self.intr.forma_array;
+                Ok(self.novo_objeto(f))
+            }
+            Op::DefProp => {
+                let o = reg(self, a);
+                let c_ = nome(self, b);
+                self.op_def_prop(proto, c, o, c_, acc);
+                Ok(acc)
+            }
+            Op::Empurra => {
+                let arr = reg(self, a);
+                self.op_empurra(arr, acc);
+                Ok(acc)
+            }
+            Op::CriaFuncao => Ok(self.op_cria_funcao(qi, proto, a)),
+            Op::Typeof => Ok(self.typeof_(acc)),
+            Op::CarregaConst => self.constante(proto, a),
+            _ => unreachable!("o N2 não pede {op:?}"),
+        })();
+        match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                self.jit_erro_em(qi, ini, e);
+                None
+            }
+        }
+    }
+
+    /// O `anotar!` do intérprete, para o caminho geral do N2.
+    #[inline]
+    fn jit_perfil(&mut self, proto: usize, c: u32, a: Valor, b: Valor, r: Valor) {
+        if self.protos[proto].tipos.get(c as usize).is_some_and(|&t| t < tipo::ESTAVEL) {
+            self.anotar(proto, c, a, b, r);
+        }
+    }
+
+    /// `CriaObjeto n`.
+    #[inline(always)]
+    fn op_cria_objeto(&mut self, n: u32) -> Valor {
+        let f = if n <= 4 {
+            self.intr.forma_objeto
+        } else {
+            let op = self.intr.objeto_proto;
+            self.forma_para(Classe::Comum, op, n.min(64))
+        };
+        self.novo_objeto(f)
+    }
+
+    /// `DefProp`: cache de transição do objeto literal: forma de antes (`forma`), forma depois
+    /// (`forma_dono`) e o slot do campo novo.
+    #[inline(always)]
+    fn op_def_prop(&mut self, proto: usize, ci: u32, o: Valor, c: Chave, v: Valor) {
+        let antes = self.forma(o).0;
+        let e = self.protos[proto].caches[ci as usize];
+        if e.forma == antes {
+            self.g.por_u32(o.deslocamento(), e.forma_dono);
+            self.gravar_campo(o, e.deslocamento, v);
+        } else {
+            self.definir_propria(o, c, v, attr::PADRAO);
+            let depois = self.forma(o);
+            if depois.0 != antes && !self.formas.get(depois).dicionario {
+                if let Some(d) = self.formas.procurar(depois, c) {
+                    let e = &mut self.protos[proto].caches[ci as usize];
+                    (e.forma, e.forma_dono, e.deslocamento) = (antes, depois.0, d.slot);
+                }
+            }
+        }
+    }
+
+    /// `Empurra`: o item no fim do array literal.
+    #[inline(always)]
+    fn op_empurra(&mut self, a: Valor, v: Valor) {
+        let n = self.array_len(a);
+        self.gravar_elemento(a, n, v);
+    }
+
+    /// `o[k]`.
+    #[inline(always)]
+    fn op_le_item(&mut self, o: Valor, k: Valor) -> Res<Valor> {
+        if k.e_int() && k.como_int() >= 0 && self.e_objeto(o) {
+            if let Some(v) = self.elemento(o, k.como_int() as u32) {
+                return Ok(v);
+            }
+            if self.formas.get(self.forma(o)).classe == Classe::ArrayTipado {
+                return Ok(self.tipado_ler(o, k.como_int() as u32).unwrap_or(Valor::UNDEFINED));
+            }
+        }
+        let k = self.para_chave(k)?;
+        self.obter(o, k)
+    }
+
+    /// `o[kv] = v`.
+    #[inline(always)]
+    fn op_grava_item(&mut self, o: Valor, kv: Valor, v: Valor, estrito: bool) -> Res<()> {
+        if kv.e_int() && kv.como_int() >= 0 && self.e_objeto(o) {
+            let i = kv.como_int() as u32;
+            let classe = self.formas.get(self.forma(o)).classe;
+            if classe == Classe::ArrayTipado {
+                return self.tipado_gravar(o, i, v);
+            }
+            // Item que já está na lista é comum (os especiais saem dela); item novo só sem índices especiais.
+            let existe = self.elemento(o, i).is_some();
+            if matches!(classe, Classe::Array | Classe::Comum | Classe::Argumentos) && (existe || (!self.indices_especiais && (self.proto_de(o) == self.intr.array_proto || self.proto_de(o) == self.intr.objeto_proto))) {
+                if self.gravar_elemento(o, i, v) {
+                    return Ok(());
+                }
+            }
+        }
+        let k = self.para_chave(kv)?;
+        self.gravar(o, k, v, estrito)
+    }
+
+    /// `CriaFuncao k` no quadro `qi`.
+    fn op_cria_funcao(&mut self, qi: usize, proto: usize, k: u32) -> Valor {
+        let ConstRt::Funcao(p) = self.protos[proto].consts[k as usize] else { panic!("CriaFuncao sem função") };
+        let fl = self.protos[proto].codigo().flags;
+        let q = self.quadros[qi];
+        let mut this = if fl.seta { Valor(self.interno(q.funcao, F_THIS)) } else { q.this };
+        if fl.construtor_classe && fl.classe_derivada && !self.celula_this(this) && self.protos[p as usize].codigo().flags.seta {
+            // Seta no construtor derivado: o `this` (e o `super()`) fica numa célula
+            // [this, construtor, new.target] dividida com o construtor.
+            let c = self.nova_lista(3);
+            self.lista_set(c, 0, this);
+            self.lista_set(c, 1, q.funcao);
+            self.lista_set(c, 2, q.new_target);
+            self.quadros[qi].this = c;
+            this = c;
+        }
+        let f = self.closure(p, q.contexto, this, None);
+        if fl.seta || self.protos[p as usize].codigo().flags.seta {
+            // A seta herda a casa (super) de quem a cria.
+            let casa = Valor(self.interno(q.funcao, F_CASA));
+            if q.funcao != Valor::UNDEFINED && casa != Valor::UNDEFINED {
+                self.por_interno_valor(f, F_CASA, casa);
+            }
+        }
+        f
+    }
+
+    /// `LeGlobal`: o campo do objeto global pelo cache `ci`, ou o caminho geral (que enche o
+    /// cache).
+    #[inline(always)]
+    fn ler_global_cache(&mut self, proto: usize, ci: u32, c: Chave, typeof_: bool) -> Res<Valor> {
+        let g = self.intr.global;
+        let cache = self.protos[proto].caches[ci as usize];
+        if cache.forma == self.forma(g).0 && cache.forma_dono == self.epoca_lexico {
+            return Ok(self.ler_campo(g, cache.deslocamento));
+        }
+        let v = self.ler_global(c, typeof_)?;
+        if !self.lexico.contains_key(&c.0) && !self.formas.get(self.forma(g)).dicionario {
+            if let Some(d) = self.propria(g, c) {
+                if d.attrs & attr::ACESSOR == 0 {
+                    let fg = self.forma(g).0;
+                    let ep = self.epoca_lexico;
+                    let cp = &mut self.protos[proto].caches[ci as usize];
+                    cp.forma = fg;
+                    cp.deslocamento = d.slot;
+                    cp.forma_dono = ep;
+                }
+            }
+        }
+        Ok(v)
+    }
+
+    /// `GravaGlobal`, como [`Motor::ler_global_cache`].
+    #[inline(always)]
+    fn gravar_global_cache(&mut self, proto: usize, ci: u32, c: Chave, v: Valor, estrito: bool) -> Res<()> {
+        let g = self.intr.global;
+        let cache = self.protos[proto].caches[ci as usize];
+        if cache.forma == self.forma(g).0 && cache.forma_dono == self.epoca_lexico {
+            self.gravar_campo(g, cache.deslocamento, v);
+            return Ok(());
+        }
+        self.gravar_global(c, v, estrito)?;
+        if !self.lexico.contains_key(&c.0) && !self.formas.get(self.forma(g)).dicionario {
+            if let Some(d) = self.propria(g, c) {
+                if d.attrs & (attr::ACESSOR | attr::GRAVAVEL) == attr::GRAVAVEL {
+                    let fg = self.forma(g).0;
+                    let ep = self.epoca_lexico;
+                    let cp = &mut self.protos[proto].caches[ci as usize];
+                    cp.forma = fg;
+                    cp.deslocamento = d.slot;
+                    cp.forma_dono = ep;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn sem_memoria_erro(&mut self) -> Res<Valor> {
         self.terminando = true;
         self.erro_alcance("Out of memory")
@@ -2746,11 +3780,16 @@ impl Motor {
         let mut chaves = Vec::new();
         let mut p = o;
         while p != Valor::NULL {
-            for k in self.chaves_de(p, false, true, false) {
-                if !vistas.insert(k) {
+            // Proxy: as chaves e a enumerabilidade vêm das armadilhas (`ownKeys`,
+            // `getOwnPropertyDescriptor`), que podem lançar.
+            let proxy = self.formas.get(self.forma(p)).classe == Classe::Proxy;
+            let ks = if proxy { self.chaves_proprias_res(p)? } else { self.chaves_de(p, false, true, false) };
+            for k in ks {
+                if matches!(k, ChaveProp::Nome(c) if c.e_simbolo()) || !vistas.insert(k) {
                     continue;
                 }
-                let enumeravel = self.descritor_proprio(p, k).is_some_and(|d| d.attrs & attr::ENUMERAVEL != 0);
+                let d = if proxy { self.descritor_proprio_res(p, k)? } else { self.descritor_proprio(p, k) };
+                let enumeravel = d.is_some_and(|d| d.attrs & attr::ENUMERAVEL != 0);
                 if enumeravel {
                     chaves.push(k);
                 }

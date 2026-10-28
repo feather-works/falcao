@@ -15,8 +15,8 @@ pub struct Motor {
     pub caracteres: [Valor; 256],
     // ---- intérprete ----
     /// Registradores e argumentos de todos os quadros (e argumentos de nativas).
-    pub pilha: Vec<Valor>,
-    pub quadros: Vec<crate::interpretador::Quadro>,
+    pub pilha: crate::pilha::Pilha<Valor>,
+    pub quadros: crate::pilha::Pilha<crate::interpretador::Quadro>,
     pub protos: Vec<crate::funcoes::Proto>,
     pub nativas: Vec<crate::funcoes::Nativa>,
     pub intr: crate::intrinsecos::Intrinsecos,
@@ -78,6 +78,23 @@ pub struct Motor {
     /// intérprete refaz a pilha dele já com a instrução certa ([`Motor::reanotar_erro`]).
     pub erro_interno: (Valor, u32),
     pub voltas: u32,
+    /// N2 (`FALCAO_JIT`): 0 desligado, 1 laços quentes, 2 todo laço na 1ª volta (para os testes).
+    pub jit_modo: u8,
+    /// O que o código do N2 deixa para o intérprete quando desiste no meio de uma chamada: o
+    /// acumulador e o erro do quadro do topo, e onde não reentrar no código.
+    pub jit_acc: Valor,
+    pub jit_erro: Option<Valor>,
+    pub jit_pular: Option<(u32, u32)>,
+    /// Códigos do N2 aninhados agora (cada um é um quadro na pilha de máquina).
+    pub jit_profundidade: u32,
+    /// Por função (índice de `protos`): o código do N2 para a chamada direta de código para
+    /// código ([`crate::jit::EntradaJit`]; endereço 0 = pelo caminho geral).
+    pub jit_tabela: crate::pilha::Pilha<crate::jit::EntradaJit>,
+    /// Códigos substituídos (recompilados, abandonados): ficam vivos, porque um deles pode estar
+    /// rodando lá embaixo na pilha de máquina.
+    pub jit_antigos: Vec<std::rc::Rc<crate::jit::CodigoJit>>,
+    /// Abaixo deste `rsp` o código não chama direto (vai pelo caminho geral, que conta a pilha).
+    pub jit_limite: usize,
     /// Dados de quem embute o motor (o navegador guarda a página aqui), lidos pelas nativas dele.
     pub hospede: Option<Box<dyn std::any::Any>>,
     /// Promessas rejeitadas ainda sem tratador (viram o "Uncaught (in promise)" do console).
@@ -125,8 +142,8 @@ impl Motor {
             nomes: Nomes::novo(),
             simbolos: Vec::new(),
             caracteres: [Valor::UNDEFINED; 256],
-            pilha: Vec::with_capacity(1 << 16),
-            quadros: Vec::with_capacity(256),
+            pilha: crate::pilha::Pilha::com_capacidade(1 << 16),
+            quadros: crate::pilha::Pilha::com_capacidade(1024),
             protos: Vec::new(),
             nativas: Vec::new(),
             intr: crate::intrinsecos::Intrinsecos::vazios(),
@@ -159,6 +176,18 @@ impl Motor {
             limite_pilha: 1 << 20,
             erro_interno: (Valor::UNDEFINED, 0),
             voltas: 0,
+            jit_modo: match std::env::var("FALCAO_JIT").as_deref() {
+                Ok("1") => 1,
+                Ok("tudo") => 2,
+                _ => 0,
+            },
+            jit_acc: Valor::UNDEFINED,
+            jit_erro: None,
+            jit_pular: None,
+            jit_profundidade: 0,
+            jit_tabela: crate::pilha::Pilha::default(),
+            jit_antigos: Vec::new(),
+            jit_limite: 0,
             hospede: None,
             rejeicoes: Vec::new(),
             coletas: [0; 2],

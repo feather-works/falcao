@@ -280,7 +280,7 @@ fn copiar_bytes(m: &mut Motor, de: u32, para: u32, n: u32) {
 
 /// Troca o bloco do buffer por um de `n` bytes, com o começo do antigo.
 fn realocar(m: &mut Motor, buf: Valor, n: u32) -> Res<()> {
-    if !m.g.cabe(u64::from(n) + 8) {
+    if !m.g.reservar(u64::from(n) + 8) {
         return m.erro_alcance("Array buffer allocation failed");
     }
     let novo = novos_bytes(m, n);
@@ -703,7 +703,7 @@ fn lista_do_iterador(m: &mut Motor, x: Valor, metodo: Valor) -> Res<Vec<Valor>> 
 // ---------------------------------------------------------------- ArrayBuffer
 
 fn novo_buffer(m: &mut Motor, n: u32, proto: Valor, fl: u32, max: u32) -> Res<Valor> {
-    if !m.g.cabe(u64::from(n) + 8) {
+    if !m.g.reservar(u64::from(n) + 8) {
         return m.erro_alcance("Array buffer allocation failed");
     }
     let f = m.forma_para(Classe::ArrayBuffer, proto, 0);

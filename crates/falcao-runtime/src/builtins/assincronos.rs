@@ -1,7 +1,7 @@
 //! Geradores async (§27.6), o iterador async que embrulha um comum (§27.1.6) e os construtores
 //! GeneratorFunction, AsyncFunction e AsyncGeneratorFunction.
 //!
-//! Gerador async: campo 0 = quadro suspenso (cru), campo 1 = fila `[estado, (tipo, valor,
+//! Gerador async: campo 0 = quadro suspenso (cru), campo 1 = fila `[estado|início, fim, (tipo, valor,
 //! promessa)…]`, campo 2 = função. Cada next/return/throw entra na fila com a promessa que
 //! devolve; o corpo roda até um `yield` (resolve o primeiro pedido) ou um `await`.
 
@@ -20,6 +20,9 @@ const AG_PARADO: i32 = 1;
 const AG_RODANDO: i32 = 2;
 const AG_ESPERA_RETORNO: i32 = 3;
 const AG_FIM: i32 = 4;
+
+/// Itens de cabeçalho da fila (estado e início, fim) antes dos pedidos.
+pub(crate) const AG_CAB: u32 = 2;
 
 /// Tipos de pedido na fila.
 const PEDE_NEXT: i32 = 0;
@@ -281,43 +284,64 @@ impl Motor {
         Valor(self.interno(g, 1))
     }
 
+    /// Item 0: estado nos 3 bits de baixo, início da fila (menos [`AG_CAB`]) acima; item 1: fim.
+    fn ag_cab(&self, g: Valor) -> (Valor, i32, u32, u32) {
+        let f = self.ag_fila(g);
+        let x = self.lista_get(f, 0).como_int();
+        (f, x & 7, (x >> 3) as u32 + AG_CAB, self.lista_get(f, 1).como_int() as u32)
+    }
+
+    fn ag_por_cab(&mut self, f: Valor, estado: i32, ini: u32, fim: u32) {
+        self.lista_set(f, 0, Valor::int(estado | ((ini - AG_CAB) as i32) << 3));
+        self.lista_set(f, 1, Valor::int(fim as i32));
+    }
+
     fn ag_estado(&self, g: Valor) -> i32 {
-        self.lista_get(self.ag_fila(g), 0).como_int()
+        self.ag_cab(g).1
     }
 
     fn ag_por_estado(&mut self, g: Valor, e: i32) {
-        let f = self.ag_fila(g);
-        self.lista_set(f, 0, Valor::int(e));
+        let (f, _, ini, fim) = self.ag_cab(g);
+        self.ag_por_cab(f, e, ini, fim);
     }
 
+    /// Fila com folga (dobra ao encher): 20 mil `next()` pendentes não copiam a fila a cada um.
     fn ag_enfileirar(&mut self, g: Valor, tipo: i32, v: Valor, p: Valor) {
-        let f = self.ag_fila(g);
-        let n = self.lista_len(f);
-        let nova = self.redimensionar_lista(f, n + 3, Valor::UNDEFINED);
-        self.lista_set(nova, n, Valor::int(tipo));
-        self.lista_set(nova, n + 1, v);
-        self.lista_set(nova, n + 2, p);
-        self.por_interno_valor(g, 1, nova);
+        let (mut f, e, mut ini, mut fim) = self.ag_cab(g);
+        if fim + 3 > self.lista_len(f) {
+            let vivos = fim - ini;
+            let nova = self.nova_lista(AG_CAB + (2 * vivos).max(6));
+            for i in 0..vivos {
+                let x = self.lista_get(f, ini + i);
+                self.lista_set(nova, AG_CAB + i, x);
+            }
+            self.por_interno_valor(g, 1, nova);
+            (f, ini, fim) = (nova, AG_CAB, AG_CAB + vivos);
+        }
+        self.lista_set(f, fim, Valor::int(tipo));
+        self.lista_set(f, fim + 1, v);
+        self.lista_set(f, fim + 2, p);
+        self.ag_por_cab(f, e, ini, fim + 3);
     }
 
     fn ag_primeiro(&self, g: Valor) -> Option<(i32, Valor)> {
-        let f = self.ag_fila(g);
-        (self.lista_len(f) >= 4).then(|| (self.lista_get(f, 1).como_int(), self.lista_get(f, 2)))
+        let (f, _, ini, fim) = self.ag_cab(g);
+        (ini < fim).then(|| (self.lista_get(f, ini).como_int(), self.lista_get(f, ini + 1)))
     }
 
     /// Tira o primeiro pedido da fila; devolve a promessa dele.
     fn ag_tirar(&mut self, g: Valor) -> Valor {
-        let f = self.ag_fila(g);
-        let n = self.lista_len(f);
-        let p = self.lista_get(f, 3);
-        let nova = self.nova_lista(n - 3);
-        let f = self.ag_fila(g);
-        self.lista_set(nova, 0, self.lista_get(f, 0));
-        for i in 4..n {
-            let x = self.lista_get(f, i);
-            self.lista_set(nova, i - 3, x);
+        let (f, e, ini, fim) = self.ag_cab(g);
+        let p = self.lista_get(f, ini + 2);
+        for i in ini..ini + 3 {
+            self.lista_set(f, i, Valor::UNDEFINED);
         }
-        self.por_interno_valor(g, 1, nova);
+        let ini = ini + 3;
+        if ini == fim {
+            self.ag_por_cab(f, e, AG_CAB, AG_CAB);
+        } else {
+            self.ag_por_cab(f, e, ini, fim);
+        }
         p
     }
 

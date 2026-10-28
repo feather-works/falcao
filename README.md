@@ -1,17 +1,18 @@
 # Falcão
 
-Motor JavaScript escrito do zero em Rust, sem dependências, para a suíte FeatherOffice:
-roda as macros do FeatherSheet e o JavaScript das páginas do FeatherWeb.
+A JavaScript engine written from scratch in Rust, with no dependencies, for the FeatherOffice suite:
+it runs FeatherSheet macros and the JavaScript of FeatherWeb pages.
 
-- `falcao-sintaxe`: léxico e árvore sintática.
-- `falcao-bytecode`: as instruções e o gerador.
-- `falcao-runtime`: valores, gaiola (heap isolado), formas, coletor de lixo e o intérprete.
+- `falcao-sintaxe`: lexer and syntax tree.
+- `falcao-bytecode`: the instructions and the bytecode generator.
+- `falcao-runtime`: values, the cage (isolated heap), shapes, garbage collector and the interpreter.
+- `falcao-asm`: x86-64 assembler used by the JIT.
 
-O desenho está em [`ARQUITETURA.md`](ARQUITETURA.md).
+The design is described in [`ARQUITETURA.md`](ARQUITETURA.md) (in Portuguese).
 
 ```bash
 cargo test --release
-cargo run --release -p falcao-runtime --example rodar -- arquivo.js
+cargo run --release -p falcao-runtime --example rodar -- file.js
 ```
 
-Licença MIT.
+MIT license.

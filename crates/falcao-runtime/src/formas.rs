@@ -19,7 +19,9 @@ use falcao_sintaxe::atomos::MapaRapido;
 pub struct FormaId(pub u32);
 
 /// Layout do objeto na gaiola (o que o coletor precisa saber).
+/// `repr(u8)`: o N2 lê o byte direto da tabela de formas.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
 pub enum Tipo {
     /// `undefined`, `null`, `true`, `false`, buraco: `[forma][id]`.
     Fixo,
@@ -51,6 +53,7 @@ pub enum Tipo {
 
 /// Classe do objeto JS (decide os campos internos e o comportamento exótico).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
 pub enum Classe {
     Comum,
     Array,
@@ -262,6 +265,9 @@ fn misturar(h: u64, v: u64) -> u64 {
 
 pub struct Formas {
     formas: Vec<Forma>,
+    /// Tipo e classe de cada forma, juntos e pequenos (2 bytes): o caminho da chamada e o N2 os
+    /// leem sem trazer a `Forma` inteira para o cache. Os dois nunca mudam depois de criada.
+    tc: Vec<[u8; 2]>,
     tabelas: Vec<Tabela>,
     /// Raízes de objeto por (classe, protótipo, campos na linha, elementos).
     raizes: MapaRapido<(Classe, Valor, u32, TipoElementos), FormaId>,
@@ -275,9 +281,10 @@ impl Default for Formas {
 
 impl Formas {
     pub fn nova() -> Self {
-        let mut f = Self { formas: Vec::with_capacity(4096), tabelas: Vec::with_capacity(1024), raizes: MapaRapido::default() };
+        let mut f = Self { formas: Vec::with_capacity(4096), tc: Vec::with_capacity(4096), tabelas: Vec::with_capacity(1024), raizes: MapaRapido::default() };
         for (i, &tipo) in TIPOS_FIXOS.iter().enumerate() {
             f.tabelas.push(Tabela::default());
+            f.tc.push([tipo as u8, Classe::Comum as u8]);
             f.formas.push(Forma {
                 tipo,
                 classe: Classe::Comum,
@@ -306,6 +313,22 @@ impl Formas {
     #[inline(always)]
     pub fn get_mut(&mut self, id: FormaId) -> &mut Forma {
         &mut self.formas[id.0 as usize]
+    }
+
+    /// Tipo e classe da forma (como `u8`), da tabela compacta.
+    #[inline(always)]
+    pub(crate) fn tipo_classe(&self, id: FormaId) -> [u8; 2] {
+        self.tc[id.0 as usize]
+    }
+
+    /// A tabela compacta de tipo e classe, para o N2.
+    pub(crate) fn ptr_tc(&self) -> *const [u8; 2] {
+        self.tc.as_ptr()
+    }
+
+    /// A tabela crua, para o N2 ([`crate::jit`]).
+    pub(crate) fn ptr(&self) -> *const Forma {
+        self.formas.as_ptr()
     }
 
     pub fn len(&self) -> usize {
@@ -349,6 +372,7 @@ impl Formas {
 
     fn nova_forma(&mut self, f: Forma) -> FormaId {
         let id = FormaId(self.formas.len() as u32);
+        self.tc.push([f.tipo as u8, f.classe as u8]);
         self.formas.push(f);
         id
     }

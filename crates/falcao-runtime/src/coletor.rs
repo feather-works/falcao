@@ -34,6 +34,12 @@ use crate::valor::Valor;
 const ENCAMINHADO: u32 = u32::MAX;
 /// Abaixo disto a geração velha nunca pede coleta maior.
 const MAIOR_MIN: u64 = 32 << 20;
+
+/// Crescimento da velha que pede coleta sozinho (sem o berçário encher): o dobro do limite da
+/// coleta maior, para só pesar quando objetos grandes (buffers, textos) se acumulam.
+pub(crate) fn gatilho_velho(vivo: u64) -> u64 {
+    2 * MAIOR_MIN.max(vivo)
+}
 /// Bit do `with` no tamanho do contexto (ver `interpretador`).
 const CTX_COM: u32 = 1 << 31;
 
@@ -265,7 +271,7 @@ impl Motor {
             self.coleta_maior(extra);
             self.coletas[1] += 1;
         }
-        self.g.gatilho_velho = MAIOR_MIN.max(self.vivo_apos_maior);
+        self.g.gatilho_velho = gatilho_velho(self.vivo_apos_maior);
         self.g.coleta_pendente = self.estresse;
     }
 
@@ -276,7 +282,7 @@ impl Motor {
         self.coleta_maior(extra);
         self.coletas[0] += 1;
         self.coletas[1] += 1;
-        self.g.gatilho_velho = MAIOR_MIN.max(self.vivo_apos_maior);
+        self.g.gatilho_velho = gatilho_velho(self.vivo_apos_maior);
         self.g.coleta_pendente = self.estresse;
     }
 

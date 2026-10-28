@@ -559,8 +559,33 @@ fn repeat(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
         return m.erro_alcance("Invalid string length");
     }
     let u = m.texto_u16_de(t);
-    let r = u.repeat(k as usize);
-    Ok(m.texto_u16(&r))
+    let total = (n * k) as u32;
+    if total < 4096 {
+        let r = u.repeat(k as usize);
+        return Ok(m.texto_u16(&r));
+    }
+    // Grande: monta direto na gaiola (Latin-1 se der), dobrando a parte já copiada.
+    let latin1 = u.iter().all(|&c| c < 256);
+    let r = m.texto_plano_novo(total, latin1)?;
+    let d = r.deslocamento() + 16;
+    if latin1 {
+        let b = m.g.bytes_mut(d, total);
+        b.iter_mut().zip(&u).for_each(|(x, &c)| *x = c as u8);
+        dobrar(b, u.len());
+    } else {
+        m.g.u16s_mut(d, u.len() as u32).copy_from_slice(&u);
+        dobrar(m.g.u16s_mut(d, total), u.len());
+    }
+    Ok(r)
+}
+
+/// Repete os primeiros `feito` itens até encher `b`.
+fn dobrar<T: Copy>(b: &mut [T], mut feito: usize) {
+    while feito < b.len() {
+        let c = feito.min(b.len() - feito);
+        b.copy_within(0..c, feito);
+        feito += c;
+    }
 }
 
 fn slice(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
@@ -930,7 +955,7 @@ fn replace_all(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
             m.para_texto(r)?
         } else {
             let novo = substituicao(&modelo, &tu, pos, &su);
-            m.texto_u16(&novo)
+            m.texto_u16_res(&novo)?
         };
         partes.push(sub);
         fim_ant = pos + su.len();

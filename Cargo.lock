@@ -17,6 +17,7 @@ dependencies = [
 name = "falcao-runtime"
 version = "0.1.0"
 dependencies = [
+ "falcao-asm",
  "falcao-bytecode",
  "falcao-sintaxe",
 ]

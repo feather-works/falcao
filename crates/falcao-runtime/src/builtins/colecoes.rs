@@ -14,6 +14,7 @@
 //! o callback nunca roda.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
 
 use crate::formas::{attr, Chave, Classe};
 use crate::funcoes::{Args, FnNativa, Res};
@@ -39,16 +40,89 @@ pub enum ChaveTabela {
 pub struct Tabela {
     pub itens: Vec<Option<(Valor, Valor)>>,
     /// Números, BigInt, objetos e textos com unidade acima de 255.
-    pub indice: HashMap<ChaveTabela, usize>,
+    pub indice: HashMap<ChaveTabela, usize, Semeado>,
     /// Textos só com unidades até 255 (quase todas as chaves), pelos bytes: a busca lê os bytes
     /// direto da gaiola, sem copiar o texto a cada `get`/`has`.
-    pub textos: HashMap<Bytes, usize>,
+    pub textos: HashMap<Bytes, usize, Semeado>,
     pub vivos: usize,
 }
 
 impl Tabela {
     pub(crate) fn nova() -> Self {
-        Tabela { itens: Vec::new(), indice: HashMap::new(), textos: HashMap::new(), vivos: 0 }
+        Tabela { itens: Vec::new(), indice: HashMap::default(), textos: HashMap::default(), vivos: 0 }
+    }
+}
+
+/// O hash das chaves de Map/Set: multiplicação dobrada (o produto de 128 bits, alto xor baixo),
+/// 8 bytes por vez, com uma semente aleatória por processo. Rápido como o `HashRapido` da
+/// sintaxe, sem deixar um script escolher chaves que colidem (o que o SipHash evitava, a um
+/// custo bem maior por chave).
+#[derive(Clone, Copy)]
+pub struct Semeado(u64);
+
+impl Default for Semeado {
+    fn default() -> Self {
+        static SEMENTE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        Semeado(*SEMENTE.get_or_init(|| std::collections::hash_map::RandomState::new().hash_one(0x5EED_u64) | 1))
+    }
+}
+
+impl BuildHasher for Semeado {
+    type Hasher = HashSemeado;
+    #[inline]
+    fn build_hasher(&self) -> HashSemeado {
+        HashSemeado(self.0)
+    }
+}
+
+pub struct HashSemeado(u64);
+
+#[inline(always)]
+fn dobrar(a: u64) -> u64 {
+    let p = u128::from(a) * 0x9E37_79B9_7F4A_7C15;
+    (p as u64) ^ ((p >> 64) as u64)
+}
+
+impl Hasher for HashSemeado {
+    #[inline]
+    fn write(&mut self, b: &[u8]) {
+        let mut h = self.0;
+        let mut pedacos = b.chunks_exact(8);
+        for p in &mut pedacos {
+            h = dobrar(h ^ u64::from_le_bytes([p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]]));
+        }
+        let resto = pedacos.remainder();
+        if !resto.is_empty() {
+            let mut w = [0u8; 8];
+            w[..resto.len()].copy_from_slice(resto);
+            h = dobrar(h ^ u64::from_le_bytes(w));
+        }
+        self.0 = h;
+    }
+
+    #[inline]
+    fn write_u64(&mut self, x: u64) {
+        self.0 = dobrar(self.0 ^ x);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, x: u32) {
+        self.write_u64(u64::from(x));
+    }
+
+    #[inline]
+    fn write_u8(&mut self, x: u8) {
+        self.write_u64(u64::from(x));
+    }
+
+    #[inline]
+    fn write_usize(&mut self, x: usize) {
+        self.write_u64(x as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
     }
 }
 
@@ -201,13 +275,13 @@ pub(super) fn instalar(m: &mut Motor) {
     m.definir_propria(sp, fixos::KEYS, vals, attr::METODO);
     metodo_cap(m, sp, "entries", 0, set_entries, sip);
     m.definir_propria(sp, simb::ITERATOR, vals, attr::METODO);
-    m.metodo(sp, "union", 1, set_union);
-    m.metodo(sp, "intersection", 1, set_intersection);
-    m.metodo(sp, "difference", 1, set_difference);
-    m.metodo(sp, "symmetricDifference", 1, set_sym_difference);
-    m.metodo(sp, "isSubsetOf", 1, set_is_subset_of);
-    m.metodo(sp, "isSupersetOf", 1, set_is_superset_of);
-    m.metodo(sp, "isDisjointFrom", 1, set_is_disjoint_from);
+    metodo_cap(m, sp, "union", 1, set_union, sp);
+    metodo_cap(m, sp, "intersection", 1, set_intersection, sp);
+    metodo_cap(m, sp, "difference", 1, set_difference, sp);
+    metodo_cap(m, sp, "symmetricDifference", 1, set_sym_difference, sp);
+    metodo_cap(m, sp, "isSubsetOf", 1, set_is_subset_of, sp);
+    metodo_cap(m, sp, "isSupersetOf", 1, set_is_superset_of, sp);
+    metodo_cap(m, sp, "isDisjointFrom", 1, set_is_disjoint_from, sp);
     etiqueta(m, sp, "Set");
 
     // ---- iteradores de Map e Set (o `next` é o mesmo: os dois têm a tabela no alvo)
@@ -276,7 +350,10 @@ fn ligar(m: &mut Motor, c: Valor, nome: &str, proto: Valor) {
 /// Método nativo com um valor capturado (protótipo do iterador, ou o segredo do WeakRef).
 fn metodo_cap(m: &mut Motor, obj: Valor, nome: &'static str, comp: u32, f: FnNativa, cap: Valor) -> Valor {
     let id = m.registrar_nativa(nome, f, false);
-    let fun = m.nativa_com(id, comp, cap);
+    // Como `nativa_com`, mas com o `name` (nativa_com cria função sem nome).
+    let n = m.texto(nome);
+    let forma = m.intr.forma_funcao_simples;
+    let fun = m.objeto_funcao(forma, id | crate::funcoes::BIT_NATIVA, cap, comp, n);
     let c = m.chave(nome);
     m.definir_propria(obj, c, fun, attr::METODO);
     fun
@@ -709,7 +786,7 @@ fn set_entries(m: &mut Motor, this: Valor, _a: Args, _nt: Valor) -> Res<Valor> {
     novo_iterador(m, this, &[Classe::Conjunto], "Set.prototype.entries", IT_PARES, p)
 }
 
-/// Operações entre conjuntos. shortcut: o argumento tem de ser um Set (nada de set-like).
+/// Operações entre conjuntos (§24.2.4): o argumento é qualquer set-like (`size`, `has`, `keys`).
 #[derive(Clone, Copy)]
 enum Op {
     Uniao,
@@ -721,63 +798,216 @@ enum Op {
     ESdisjunto,
 }
 
-fn outro_conjunto(m: &mut Motor, v: Valor) -> Res<usize> {
-    if m.e_objeto(v) && m.formas.get(m.forma(v)).classe == Classe::Conjunto {
-        return Ok(m.interno(v, 1) as usize);
+/// GetSetRecord: o outro conjunto, o tamanho dele e os métodos `has` e `keys`.
+fn registro_de_conjunto(m: &mut Motor, v: Valor) -> Res<(Valor, f64, Valor, Valor)> {
+    if !m.e_objeto(v) {
+        let d = m.descrever(v);
+        return m.erro_tipo(&format!("{d} is not an object"));
     }
-    m.erro_tipo("argument must be a Set")
+    let bruto = m.obter(v, ChaveProp::Nome(fixos::SIZE))?;
+    let n = m.para_numero(bruto)?;
+    if n.is_nan() {
+        return m.erro_tipo("The 'size' property must be a number");
+    }
+    let n = n.trunc() + 0.0;
+    if n < 0.0 {
+        return m.erro_alcance("The 'size' property must not be negative");
+    }
+    let metodo = |m: &mut Motor, c| -> Res<Valor> {
+        let f = m.obter(v, ChaveProp::Nome(c))?;
+        if !m.e_funcao(f) {
+            let nome = String::from_utf16_lossy(m.nomes.texto(c));
+            return m.erro_tipo(&format!("The '{nome}' property must be a function"));
+        }
+        Ok(f)
+    };
+    let has = metodo(m, fixos::HAS)?;
+    let keys = metodo(m, fixos::KEYS)?;
+    Ok((v, n, has, keys))
 }
 
-/// Os itens de `xs` cuja presença na tabela `idx` é `presente`.
-fn filtrar(m: &mut Motor, xs: &[Valor], idx: usize, presente: bool) -> Vec<Valor> {
-    let mut r = Vec::new();
-    for &x in xs {
-        if contem(m, idx, x) == presente {
-            r.push(x);
+/// GetKeysIterator: (iterador, next).
+fn iterador_de_chaves(m: &mut Motor, outro: Valor, keys: Valor) -> Res<(Valor, Valor)> {
+    let it = m.chamar(keys, outro, &[])?;
+    if !m.e_objeto(it) {
+        return m.erro_tipo("keys() must return an object");
+    }
+    let next = m.obter(it, ChaveProp::Nome(fixos::NEXT))?;
+    if !m.e_funcao(next) {
+        return m.erro_tipo("The iterator's 'next' property must be a function");
+    }
+    Ok((it, next))
+}
+
+/// IteratorStepValue, com -0 trocado por +0.
+fn proxima_chave(m: &mut Motor, (it, next): (Valor, Valor)) -> Res<Option<Valor>> {
+    let r = m.chamar(next, it, &[])?;
+    if !m.e_objeto(r) {
+        let d = m.descrever(r);
+        return m.erro_tipo(&format!("Iterator result {d} is not an object"));
+    }
+    let feito = m.obter(r, ChaveProp::Nome(fixos::DONE))?;
+    if m.verdadeiro(feito) {
+        return Ok(None);
+    }
+    let v = m.obter(r, ChaveProp::Nome(fixos::VALUE))?;
+    Ok(Some(sem_menos_zero(m, v)))
+}
+
+/// IteratorClose com conclusão normal (o resultado de `return` só é conferido se é objeto).
+fn fechar_chaves(m: &mut Motor, it: Valor) -> Res<()> {
+    if let Some(f) = m.obter_metodo(it, ChaveProp::Nome(fixos::RETURN))? {
+        let r = m.chamar(f, it, &[])?;
+        if !m.e_objeto(r) {
+            return m.erro_tipo("Iterator result is not an object");
         }
     }
-    r
+    Ok(())
 }
 
-/// Conjunto novo (com o protótipo de `this`) com os itens dados.
-fn criar_conjunto(m: &mut Motor, this: Valor, itens: &[Valor]) -> Valor {
-    let p = m.proto_de(this);
-    let o = novo_com(m, p, Classe::Conjunto);
-    let idx = m.interno(o, 1) as usize;
-    for &x in itens {
-        inserir(m, idx, x, x);
-    }
-    o
+/// Item `i` da tabela, se ainda existe (a tabela pode mudar dentro de `has`).
+fn item_em(m: &Motor, idx: usize, i: usize) -> Option<Option<Valor>> {
+    m.tabelas[idx].itens.get(i).map(|x| x.map(|(k, _)| k))
 }
 
 fn conjuntos_op(m: &mut Motor, this: Valor, a: Args, op: Op) -> Res<Valor> {
+    // %Set.prototype% (capturado na instalação), lido antes de chamar qualquer código.
+    let proto = m.capturado();
     let idx = tabela_de(m, this, &[Classe::Conjunto], "Set.prototype operation")?;
-    let v = m.arg(a, 0);
-    let oi = outro_conjunto(m, v)?;
-    let eu = chaves_vivas(m, idx);
-    let outro = chaves_vivas(m, oi);
+    let (outro, tam, has, keys) = registro_de_conjunto(m, m.arg(a, 0))?;
+    let eu_tam = m.tabelas[idx].vivos as f64;
+    let tem_no_outro = |m: &mut Motor, e: Valor| -> Res<bool> {
+        let r = m.chamar(has, outro, &[e])?;
+        Ok(m.verdadeiro(r))
+    };
+    // Resultado novo com %Set.prototype% e, se pedido, cópia dos itens de `this`.
+    let novo = |m: &mut Motor, copiar: bool| -> (Valor, usize) {
+        let r = novo_com(m, proto, Classe::Conjunto);
+        let ri = m.interno(r, 1) as usize;
+        if copiar {
+            for x in chaves_vivas(m, idx) {
+                inserir(m, ri, x, x);
+            }
+        }
+        (r, ri)
+    };
     Ok(match op {
         Op::Uniao => {
-            let mut r = eu;
-            r.extend(outro);
-            criar_conjunto(m, this, &r)
+            let ki = iterador_de_chaves(m, outro, keys)?;
+            let (r, ri) = novo(m, true);
+            while let Some(x) = proxima_chave(m, ki)? {
+                if !contem(m, ri, x) {
+                    inserir(m, ri, x, x);
+                }
+            }
+            r
         }
         Op::Intersecao => {
-            let r = filtrar(m, &eu, oi, true);
-            criar_conjunto(m, this, &r)
+            let (r, ri) = novo(m, false);
+            if eu_tam <= tam {
+                let mut i = 0;
+                while let Some(e) = item_em(m, idx, i) {
+                    i += 1;
+                    if let Some(e) = e {
+                        if tem_no_outro(m, e)? && !contem(m, ri, e) {
+                            inserir(m, ri, e, e);
+                        }
+                    }
+                }
+            } else {
+                let ki = iterador_de_chaves(m, outro, keys)?;
+                while let Some(x) = proxima_chave(m, ki)? {
+                    if contem(m, idx, x) && !contem(m, ri, x) {
+                        inserir(m, ri, x, x);
+                    }
+                }
+            }
+            r
         }
         Op::Diferenca => {
-            let r = filtrar(m, &eu, oi, false);
-            criar_conjunto(m, this, &r)
+            let (r, ri) = novo(m, true);
+            if eu_tam <= tam {
+                let n = m.tabelas[ri].itens.len();
+                for i in 0..n {
+                    if let Some(Some(e)) = item_em(m, ri, i) {
+                        if tem_no_outro(m, e)? {
+                            apagar(m, ri, e);
+                        }
+                    }
+                }
+            } else {
+                let ki = iterador_de_chaves(m, outro, keys)?;
+                while let Some(x) = proxima_chave(m, ki)? {
+                    apagar(m, ri, x);
+                }
+            }
+            r
         }
         Op::DiferencaSimetrica => {
-            let mut r = filtrar(m, &eu, oi, false);
-            r.extend(filtrar(m, &outro, idx, false));
-            criar_conjunto(m, this, &r)
+            let ki = iterador_de_chaves(m, outro, keys)?;
+            let (r, ri) = novo(m, true);
+            while let Some(x) = proxima_chave(m, ki)? {
+                let ja = contem(m, ri, x);
+                if contem(m, idx, x) {
+                    if ja {
+                        apagar(m, ri, x);
+                    }
+                } else if !ja {
+                    inserir(m, ri, x, x);
+                }
+            }
+            r
         }
-        Op::ESubconjunto => Valor::bool(filtrar(m, &eu, oi, false).is_empty()),
-        Op::ESuperconjunto => Valor::bool(filtrar(m, &outro, idx, false).is_empty()),
-        Op::ESdisjunto => Valor::bool(filtrar(m, &eu, oi, true).is_empty()),
+        Op::ESubconjunto => {
+            if eu_tam > tam {
+                return Ok(Valor::FALSE);
+            }
+            let mut i = 0;
+            while let Some(e) = item_em(m, idx, i) {
+                i += 1;
+                if let Some(e) = e {
+                    if !tem_no_outro(m, e)? {
+                        return Ok(Valor::FALSE);
+                    }
+                }
+            }
+            Valor::TRUE
+        }
+        Op::ESuperconjunto => {
+            if eu_tam < tam {
+                return Ok(Valor::FALSE);
+            }
+            let ki = iterador_de_chaves(m, outro, keys)?;
+            while let Some(x) = proxima_chave(m, ki)? {
+                if !contem(m, idx, x) {
+                    fechar_chaves(m, ki.0)?;
+                    return Ok(Valor::FALSE);
+                }
+            }
+            Valor::TRUE
+        }
+        Op::ESdisjunto => {
+            if eu_tam <= tam {
+                let mut i = 0;
+                while let Some(e) = item_em(m, idx, i) {
+                    i += 1;
+                    if let Some(e) = e {
+                        if tem_no_outro(m, e)? {
+                            return Ok(Valor::FALSE);
+                        }
+                    }
+                }
+            } else {
+                let ki = iterador_de_chaves(m, outro, keys)?;
+                while let Some(x) = proxima_chave(m, ki)? {
+                    if contem(m, idx, x) {
+                        fechar_chaves(m, ki.0)?;
+                        return Ok(Valor::FALSE);
+                    }
+                }
+            }
+            Valor::TRUE
+        }
     })
 }
 

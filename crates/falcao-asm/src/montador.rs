@@ -124,6 +124,10 @@ pub enum Unario {
     Neg,
     Inc,
     Dec,
+    /// edx:eax / r sem sinal: quociente em eax, resto em edx (rdx:rax em 64 bits).
+    Div,
+    /// Idem, com sinal.
+    Idiv,
 }
 
 /// Aritmética escalar de doubles (o byte é o opcode depois de `F2 0F`).
@@ -386,6 +390,8 @@ impl Montador {
             Unario::Neg => (0xF7, 3),
             Unario::Inc => (0xFF, 0),
             Unario::Dec => (0xFF, 1),
+            Unario::Div => (0xF7, 6),
+            Unario::Idiv => (0xF7, 7),
         };
         self.op(None, t == Tam::B64, &[opcode], n, Rm::R(r), false);
     }

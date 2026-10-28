@@ -56,7 +56,7 @@ impl Motor {
     }
 
     /// Campo interno `i` (cru, 32 bits).
-    #[inline]
+    #[inline(always)]
     pub fn interno(&self, obj: Valor, i: u32) -> u32 {
         self.g.u32_em(obj.deslocamento() + 12 + 4 * i)
     }
@@ -261,6 +261,23 @@ impl Motor {
     /// Grava o item `i` (estica a lista; atualiza `length` de array). Falso se o objeto está
     /// fechado e o item não existe.
     pub fn gravar_elemento(&mut self, obj: Valor, i: u32, v: Valor) -> bool {
+        // O caso comum (`map`, `filter`, `a[i] = x`): array, dentro da lista, sem criar buraco
+        // nem trocar o tipo dos elementos. O resto, abaixo.
+        let el = self.elementos(obj);
+        if el != Valor::LISTA_VAZIA && i < self.lista_len(el) {
+            let f = self.formas.get(self.forma(obj));
+            let (tipo, extensivel, e_array, com_nomes) = (f.elementos, f.extensivel, f.classe == Classe::Array, f.n > 0);
+            let len = if e_array { self.array_len(obj) } else { 0 };
+            let existe = self.lista_get(el, i) != Valor::BURACO;
+            let tipo_ok = tipo != TipoElementos::Dicionario && (v.e_int() || !matches!(tipo, TipoElementos::Inteiros | TipoElementos::InteirosComBuracos));
+            if e_array && extensivel && tipo_ok && i <= len && (existe || (!self.indices_especiais && !com_nomes)) {
+                self.lista_set(el, i, v);
+                if i == len {
+                    self.por_interno(obj, 0, i + 1);
+                }
+                return true;
+            }
+        }
         let d = obj.deslocamento();
         let mut el = self.elementos(obj);
         let cap = if el == Valor::LISTA_VAZIA { 0 } else { self.lista_len(el) };

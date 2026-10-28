@@ -169,7 +169,7 @@ fn casos_exaustivos() -> Vec<Caso> {
                 let mm = Mem::base(a, 8);
                 v.push(caso(move |m| m.guardar_imm(t, mm, imm), format!("mov {},{}", mem(mm, ptr(t)), hex(imm as i64, t))));
             }
-            for (op, nome) in [(Unario::Not, "not"), (Unario::Neg, "neg"), (Unario::Inc, "inc"), (Unario::Dec, "dec")] {
+            for (op, nome) in [(Unario::Not, "not"), (Unario::Neg, "neg"), (Unario::Inc, "inc"), (Unario::Dec, "dec"), (Unario::Div, "div"), (Unario::Idiv, "idiv")] {
                 v.push(caso(move |m| m.unario(op, t, a), format!("{nome} {}", r(t, a))));
             }
             for (op, nome) in [(Desloc::Shl, "shl"), (Desloc::Shr, "shr"), (Desloc::Sar, "sar")] {

@@ -814,6 +814,72 @@ impl Motor {
         }
     }
 
+    /// `[[GetOwnProperty]]` que passa pela armadilha `getOwnPropertyDescriptor` de Proxy.
+    /// shortcut: sem as invariantes de §10.5.5 (alvo não configurável/não extensível); entram
+    /// junto com as de `defineProperty`.
+    pub(crate) fn descritor_proprio_res(&mut self, o: Valor, k: ChaveProp) -> Res<Option<DescProp>> {
+        if self.formas.get(self.forma(o)).classe != Classe::Proxy {
+            return Ok(self.descritor_proprio(o, k));
+        }
+        self.checar_pilha()?;
+        let alvo = Valor(self.interno(o, 0));
+        let Some((f, t)) = self.armadilha(o, "getOwnPropertyDescriptor")? else {
+            return self.descritor_proprio_res(alvo, k);
+        };
+        let kv = self.chave_para_valor(k);
+        let r = self.chamar(f, t, &[alvo, kv])?;
+        if r == Valor::UNDEFINED {
+            return Ok(None);
+        }
+        if !self.e_objeto(r) {
+            return self.erro_tipo("'getOwnPropertyDescriptor' on proxy: trap returned neither object nor undefined");
+        }
+        let d = self.para_descritor(r)?;
+        // CompletePropertyDescriptor.
+        let mut attrs = 0;
+        if d.enumeravel == Some(true) {
+            attrs |= attr::ENUMERAVEL;
+        }
+        if d.configuravel == Some(true) {
+            attrs |= attr::CONFIGURAVEL;
+        }
+        Ok(Some(if d.e_acessor() {
+            DescProp { valor: Valor::UNDEFINED, get: d.get.unwrap_or(Valor::UNDEFINED), set: d.set.unwrap_or(Valor::UNDEFINED), attrs: attrs | attr::ACESSOR }
+        } else {
+            if d.gravavel == Some(true) {
+                attrs |= attr::GRAVAVEL;
+            }
+            DescProp { valor: d.valor.unwrap_or(Valor::UNDEFINED), get: Valor::UNDEFINED, set: Valor::UNDEFINED, attrs }
+        }))
+    }
+
+    /// `[[OwnPropertyKeys]]` que passa pela armadilha `ownKeys` de Proxy (textos e símbolos).
+    /// shortcut: sem as invariantes de §10.5.11 (repetidas, chaves fixas do alvo faltando).
+    pub(crate) fn chaves_proprias_res(&mut self, o: Valor) -> Res<Vec<ChaveProp>> {
+        if self.formas.get(self.forma(o)).classe != Classe::Proxy {
+            return Ok(self.chaves_de(o, false, true, true));
+        }
+        self.checar_pilha()?;
+        let alvo = Valor(self.interno(o, 0));
+        let Some((f, t)) = self.armadilha(o, "ownKeys")? else {
+            return self.chaves_proprias_res(alvo);
+        };
+        let r = self.chamar(f, t, &[alvo])?;
+        if !self.e_objeto(r) {
+            return self.erro_tipo("CreateListFromArrayLike called on non-object");
+        }
+        let n = self.comprimento_de(r)?;
+        let mut ks = Vec::new();
+        for i in 0..n {
+            let v = self.obter_indice(r, i)?;
+            if !self.e_texto(v) && !self.e_simbolo(v) {
+                return self.erro_tipo("proxy [[OwnPropertyKeys]] must return an array with only string and symbol elements");
+            }
+            ks.push(self.para_chave(v)?);
+        }
+        Ok(ks)
+    }
+
     fn proxy_tem(&mut self, p: Valor, k: ChaveProp) -> Res<bool> {
         self.checar_pilha()?;
         let alvo = Valor(self.interno(p, 0));

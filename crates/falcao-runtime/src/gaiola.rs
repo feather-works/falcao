@@ -78,7 +78,7 @@ impl Gaiola {
             lembrados: Vec::new(),
             coleta_pendente: false,
             velho_desde_coleta: 0,
-            gatilho_velho: 32 << 20,
+            gatilho_velho: crate::coletor::gatilho_velho(0),
         }
     }
 
@@ -90,6 +90,29 @@ impl Gaiola {
     /// Ainda cabem `bytes` abaixo do [`TETO`].
     pub fn cabe(&self, bytes: u64) -> bool {
         self.em_uso() + bytes <= TETO
+    }
+
+    /// Cabem `bytes` a mais na velha: abaixo do [`TETO`] e já pedidos ao sistema. Pedido que o
+    /// sistema nega vira `false` (RangeError no chamador), não aborto do processo.
+    pub fn reservar(&mut self, bytes: u64) -> bool {
+        let fim = u64::from(self.topo_velho) + ((bytes + 7) & !7);
+        self.cabe(bytes) && fim <= u64::from(u32::MAX & !7) && self.crescer(fim as usize)
+    }
+
+    /// Cresce `mem` até `fim` bytes: o dobro se o sistema der, senão só o necessário.
+    fn crescer(&mut self, fim: usize) -> bool {
+        let tem = self.mem.len() * 8;
+        if fim <= tem {
+            return true;
+        }
+        let dobro = (tem * 2).min(u32::MAX as usize & !7);
+        for alvo in [fim.max(dobro), fim] {
+            if self.mem.try_reserve_exact(alvo / 8 - self.mem.len()).is_ok() {
+                self.mem.resize(alvo / 8, 0);
+                return true;
+            }
+        }
+        false
     }
 
     pub fn tamanho_reservado(&self) -> usize {
@@ -110,6 +133,12 @@ impl Gaiola {
     /// Aloca `bytes` (zerados) e devolve o deslocamento. Nunca coleta aqui: quando o berçário
     /// enche, aloca na velha e marca [`Gaiola::coleta_pendente`].
     #[inline]
+    /// Topo e teto do berçário, para o N2 alocar direto (o mesmo que [`Gaiola::alocar`] faz no
+    /// caso comum; o resto vai à nativa).
+    pub(crate) fn ptr_topo_teto(&mut self) -> (*mut u32, *const u32) {
+        (std::ptr::addr_of_mut!(self.topo_bercario), std::ptr::addr_of!(self.teto_bercario))
+    }
+
     pub fn alocar(&mut self, bytes: u32) -> u32 {
         let b = arredondar(bytes);
         let d = self.topo_bercario;
@@ -127,10 +156,8 @@ impl Gaiola {
         let b = arredondar(bytes);
         let d = self.topo_velho;
         let fim = d.checked_add(b).expect("gaiola cheia (4 GB)");
-        if fim as usize > self.mem.len() * 8 {
-            let novo = (fim as usize).max(self.mem.len() * 8 * 2).min(u32::MAX as usize & !7);
-            assert!(novo >= fim as usize, "gaiola cheia (4 GB)");
-            self.mem.resize(novo / 8, 0);
+        if !self.crescer(fim as usize) {
+            std::alloc::handle_alloc_error(std::alloc::Layout::array::<u64>(fim as usize / 8).expect("cabe em u32"));
         }
         self.topo_velho = fim;
         self.velho_desde_coleta += u64::from(b);
@@ -180,7 +207,7 @@ impl Gaiola {
     // ---------------------------------------------------------------- acesso
 
     #[inline(always)]
-    fn ptr(&self) -> *const u8 {
+    pub(crate) fn ptr(&self) -> *const u8 {
         self.mem.as_ptr() as *const u8
     }
 

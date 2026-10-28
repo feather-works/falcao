@@ -15,6 +15,7 @@ pub type Res<T> = Result<T, Valor>;
 
 /// Argumentos de uma chamada: uma faixa da pilha do motor.
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct Args {
     pub base: u32,
     pub n: u32,
@@ -113,10 +114,24 @@ pub struct Proto {
     /// Feedback de tipos por cache ([`tipo`]); os caches de propriedade/chamada deixam 0.
     pub tipos: Vec<u8>,
     pub nome: Valor,
+    /// Cópias do `FuncaoBytecode` que toda chamada lê (sem passar pelo script).
+    pub parametros: u32,
+    pub registradores: u32,
+    pub flags: falcao_bytecode::Flags,
     /// Chamadas e voltas de laço (amostradas de 256 em 256 no `SaltaAtras`): o calor para o N2
     /// ([`Proto::quente`]).
     pub chamadas: u32,
     pub voltas: u32,
+    /// O código do N2 (None = ainda não, ou não compila, ou desistiu pelas guardas), se já
+    /// tentou compilar, e as saídas por guarda.
+    pub jit: Option<Rc<crate::jit::CodigoJit>>,
+    pub jit_tentou: bool,
+    pub jit_falhas: u32,
+    /// Saídas para o N1 por instrução que o N2 não sabe: muitas = a função só sai e entra, e o
+    /// código passa a entrar só pelos laços.
+    pub jit_n1: u32,
+    /// Vezes que recompilou para pôr um laço quente que ficou de fora (o cache dele estava vazio).
+    pub jit_recompilou: u8,
     /// Fonte do script (para `Function.prototype.toString`).
     pub fonte: Option<Rc<str>>,
     /// Nome da fonte na pilha dos erros (`macro`, `api`, a URL do script…).
@@ -234,7 +249,7 @@ impl Motor {
             };
             let caches = vec![CacheProp::default(); fb.caches as usize];
             let tipos = vec![0; fb.caches as usize];
-            self.protos.push(Proto { script: script.clone(), indice: i, consts, caches, tipos, nome, chamadas: 0, voltas: 0, fonte: None, origem: None, modulo: u32::MAX });
+            self.protos.push(Proto { script: script.clone(), indice: i, consts, caches, tipos, nome, parametros: fb.parametros, registradores: fb.registradores, flags: fb.flags, chamadas: 0, voltas: 0, jit: None, jit_tentou: false, jit_falhas: 0, jit_n1: 0, jit_recompilou: 0, fonte: None, origem: None, modulo: u32::MAX });
         }
         base
     }

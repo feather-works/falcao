@@ -77,10 +77,12 @@ impl Motor {
 
     /// StringToBigInt (§7.1.14): `None` se o texto não é um inteiro válido.
     pub fn texto_para_bigint(&mut self, t: Valor) -> Option<Grande> {
-        let u = self.texto_u16_de(t);
-        let ini = u.iter().position(|&c| !numeros::e_espaco(c)).unwrap_or(u.len());
-        let fim = u.iter().rposition(|&c| !numeros::e_espaco(c)).map_or(ini, |i| i + 1);
-        let s: Vec<u8> = u[ini..fim].iter().map(|&c| if c < 128 { c as u8 } else { b'!' }).collect();
+        // Lê as unidades na gaiola, sem cópia UTF-16 (texto de 2^29 dígitos é 1 GB a mais).
+        let p = self.achatar(t);
+        let u = self.unidades_planas(p);
+        let ini = (0..u.len()).position(|i| !numeros::e_espaco(u.em(i))).unwrap_or(u.len());
+        let fim = (ini..u.len()).rposition(|i| !numeros::e_espaco(u.em(i))).map_or(ini, |i| ini + i + 1);
+        let s: Vec<u8> = (ini..fim).map(|i| u.em(i)).map(|c| if c < 128 { c as u8 } else { b'!' }).collect();
         let (base, digitos, neg) = match s.as_slice() {
             [] => return Some(Grande::zero()),
             [b'0', b'x' | b'X', r @ ..] => (16, r, false),
@@ -116,7 +118,13 @@ impl Motor {
             return match self.texto_para_bigint(p) {
                 Some(x) => Ok(x),
                 None => {
-                    let s = self.texto_rust(p);
+                    // Texto enorme não vai inteiro para a mensagem (2^29 dígitos = GB de format!).
+                    let s = if self.texto_len(p) > 100 {
+                        let c = self.subtexto(p, 0, 100);
+                        format!("{}...", self.texto_rust(c))
+                    } else {
+                        self.texto_rust(p)
+                    };
                     Err(self.erro(TipoErro::Sintaxe, &format!("Cannot convert {s} to a BigInt")))
                 }
             };

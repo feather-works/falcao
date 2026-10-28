@@ -6,7 +6,7 @@ use crate::intrinsecos::{simb, TipoErro};
 use crate::motor::Motor;
 use crate::nomes::fixos;
 use crate::numeros;
-use crate::textos::{indice_de_array, ChaveProp, Unidades};
+use crate::textos::{indice_de_array, ChaveProp, Unidades, TEXTO_MAX};
 use crate::valor::Valor;
 
 pub(super) fn instalar(m: &mut Motor) {
@@ -513,12 +513,32 @@ fn citar_latin1(s: &mut Vec<u16>, t: &[u8]) {
 }
 
 /// Cita o texto `t` lendo as unidades direto da gaiola (sem copiar para um `Vec`).
-fn citar_texto(m: &mut Motor, s: &mut Vec<u16>, t: Valor) {
-    let p = m.achatar(t);
+fn citar_texto(m: &mut Motor, s: &mut Vec<u16>, t: Valor) -> Res<()> {
+    let p = m.achatar_res(t)?;
+    // Texto grande: o tamanho citado (até 6× o original) sai antes; passar do maior texto ou
+    // faltar memória vira RangeError em vez de derrubar o processo.
+    if m.texto_len(p) >= 1 << 16 {
+        let extra = |c: u16| match c {
+            0x22 | 0x5c | 0x08 | 0x0c | 0x0a | 0x0d | 0x09 => 1,
+            c if c < 0x20 => 5,
+            _ => 0,
+        };
+        let n = match m.unidades_planas(p) {
+            Unidades::Latin1(b) => b.len() + b.iter().map(|&c| extra(u16::from(c))).sum::<usize>(),
+            Unidades::Utf16(u) => u.len() + u.iter().enumerate().map(|(i, &c)| if (0xd800..0xe000).contains(&c) && !par_valido(u, i) { 5 } else { extra(c) }).sum::<usize>(),
+        } + 2;
+        if s.len() + n > TEXTO_MAX as usize {
+            return m.erro_alcance("Invalid string length");
+        }
+        if s.try_reserve(n).is_err() {
+            return m.erro_alcance("Out of memory");
+        }
+    }
     match m.unidades_planas(p) {
         Unidades::Latin1(b) => citar_latin1(s, b),
         Unidades::Utf16(u) => citar(s, u),
     }
+    Ok(())
 }
 
 fn par_valido(t: &[u16], i: usize) -> bool {
@@ -571,7 +591,7 @@ fn serializar(m: &mut Motor, e: &mut Escritor, holder: Valor, k: ChaveProp, v: V
         Valor::NULL => e.saida.extend("null".encode_utf16()),
         Valor::TRUE => e.saida.extend("true".encode_utf16()),
         Valor::FALSE => e.saida.extend("false".encode_utf16()),
-        _ if m.e_texto(v) => citar_texto(m, &mut e.saida, v),
+        _ if m.e_texto(v) => citar_texto(m, &mut e.saida, v)?,
         _ if v.e_int() => escrever_int(e, v.como_int()),
         _ if m.e_numero(v) => escrever_numero(e, m.f64_de(v)),
         _ if m.e_bigint(v) => return m.erro_tipo("Do not know how to serialize a BigInt"),
@@ -612,8 +632,8 @@ fn folha(m: &mut Motor, e: &mut Escritor, v: Valor) -> bool {
         _ if !v.e_ref() => return false,
         _ => {
             let f = m.forma(v);
-            if f == formas::LATIN1 || f == formas::UTF16 || f == formas::CORDA {
-                citar_texto(m, &mut e.saida, v);
+            if (f == formas::LATIN1 || f == formas::UTF16 || f == formas::CORDA) && m.texto_len(v) < 1 << 16 {
+                let _ = citar_texto(m, &mut e.saida, v);
             } else if f == formas::NUMERO {
                 escrever_numero(e, m.f64_de(v));
             } else {
@@ -697,7 +717,8 @@ fn plano(m: &mut Motor, e: &mut Escritor, v: Valor) -> Option<(u32, u32)> {
     for d in ds {
         let a = e.citadas.len() as u32;
         let kv = m.chave_para_valor(ChaveProp::Nome(d.chave));
-        citar_texto(m, &mut e.citadas, kv);
+        // Erro (chave enorme) cai no caminho geral, que lança.
+        citar_texto(m, &mut e.citadas, kv).ok()?;
         e.campos.push(Campo { chave: d.chave, slot: d.slot, acessor: d.attrs & attr::ACESSOR != 0, a, b: e.citadas.len() as u32 });
     }
     let p = (ini, e.campos.len() as u32);
@@ -749,7 +770,7 @@ fn objeto(m: &mut Motor, e: &mut Escritor, v: Valor) -> Res<()> {
                     None => {
                         let a = e.citadas.len() as u32;
                         let kv = m.chave_para_valor(k);
-                        citar_texto(m, &mut e.citadas, kv);
+                        citar_texto(m, &mut e.citadas, kv)?;
                         e.nomes.insert(c, (a, e.citadas.len() as u32));
                         (a, e.citadas.len() as u32)
                     }
@@ -758,7 +779,7 @@ fn objeto(m: &mut Motor, e: &mut Escritor, v: Valor) -> Res<()> {
             }
             _ => {
                 let kv = m.chave_para_valor(k);
-                citar_texto(m, &mut e.saida, kv);
+                citar_texto(m, &mut e.saida, kv)?;
             }
         }
         e.saida.push(0x3a);
@@ -787,6 +808,10 @@ fn array(m: &mut Motor, e: &mut Escritor, v: Valor) -> Res<()> {
     for i in 0..n {
         if i > 0 {
             e.saida.push(0x2c);
+        }
+        // length enorme (Proxy com 2^33): para no maior texto, não na RAM.
+        if e.saida.len() > TEXTO_MAX as usize {
+            return m.erro_alcance("Invalid string length");
         }
         quebra(e);
         let x = match m.e_array(v).then(|| m.elemento(v, i as u32)).flatten() {
@@ -842,7 +867,7 @@ fn stringify(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     let raiz = m.objeto_vazio();
     m.criar_dado(raiz, ChaveProp::Nome(fixos::ANONIMO), v)?;
     if serializar(m, &mut e, raiz, ChaveProp::Nome(fixos::ANONIMO), v)? {
-        Ok(m.texto_u16(&e.saida))
+        m.texto_u16_res(&e.saida)
     } else {
         Ok(Valor::UNDEFINED)
     }

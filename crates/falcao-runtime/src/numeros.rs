@@ -271,7 +271,7 @@ fn digitos_curtos(a: f64) -> (String, i32) {
 /// mais curtos)? Com f bits fracionários o decimal exato tem pelo menos f dígitos.
 fn pode_empatar(a: f64) -> bool {
     let (m, e) = decompor(a);
-    e >= 0 || (-e) as u32 - m.trailing_zeros() <= 18
+    e >= 0 || ((-e) as u32).saturating_sub(m.trailing_zeros()) <= 18
 }
 
 /// Sufixo de expoente "e+N" / "e-N".

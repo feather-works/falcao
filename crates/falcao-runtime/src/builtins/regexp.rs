@@ -575,7 +575,7 @@ fn simbolo_match_all(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Val
 
 /// Junta `u` ao texto em montagem sem passar do maior texto e sem abortar o processo se faltar
 /// memória: `"1".repeat(2**20).replace(/(.+)/g, "$1".repeat(2**16))` pediria 2³⁶ unidades.
-fn anexar(m: &mut Motor, r: &mut Vec<u16>, u: &[u16]) -> Res<()> {
+pub(crate) fn anexar(m: &mut Motor, r: &mut Vec<u16>, u: &[u16]) -> Res<()> {
     if r.len() + u.len() > TEXTO_MAX as usize {
         return m.erro_alcance("Invalid string length");
     }
@@ -691,6 +691,7 @@ impl Motor {
 
 fn simbolo_replace(m: &mut Motor, this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     let t = m.para_texto(m.arg(a, 0))?;
+    let t = m.achatar_res(t)?;
     let s = m.texto_u16_de(t);
     let mut subst = m.arg(a, 1);
     let funcional = m.e_funcao(subst);

@@ -7,7 +7,7 @@ use crate::intrinsecos::TipoErro;
 use crate::motor::Motor;
 use crate::nomes::fixos;
 use crate::numeros;
-use crate::textos::ChaveProp;
+use crate::textos::{ChaveProp, TEXTO_MAX};
 use crate::valor::Valor;
 
 /// Marcas que `encodeURIComponent` deixa sem escape (além dos alfanuméricos).
@@ -397,9 +397,19 @@ fn decode_uri(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
 fn codificar(m: &mut Motor, v: Valor, extra: &str) -> Res<Valor> {
     let s = m.para_texto(v)?;
     let u = m.texto_u16_de(s);
-    let mut out = String::with_capacity(u.len());
+    let mut out = String::new();
+    if out.try_reserve(u.len()).is_err() {
+        return m.erro_alcance("Out of memory");
+    }
     let mut i = 0;
     while i < u.len() {
+        // 3 bytes por unidade viram 9: para no maior texto (ou na falta de memória) com erro.
+        if out.len() > TEXTO_MAX as usize {
+            return m.erro_alcance("Invalid string length");
+        }
+        if out.capacity() - out.len() < 12 && out.try_reserve(12).is_err() {
+            return m.erro_alcance("Out of memory");
+        }
         let c = u[i];
         if c < 128 {
             let ch = c as u8 as char;
@@ -432,7 +442,13 @@ fn codificar(m: &mut Motor, v: Valor, extra: &str) -> Res<Valor> {
             }
         }
     }
-    Ok(m.texto(&out))
+    if out.len() > TEXTO_MAX as usize {
+        return m.erro_alcance("Invalid string length");
+    }
+    if out.len() >= 1 << 20 && !m.g.reservar(16 + out.len() as u64) {
+        return m.erro_alcance("Out of memory");
+    }
+    Ok(m.texto_latin1(out.as_bytes()))
 }
 
 /// Decodifica `%XX` (UTF-8). Os reservados em `reservados` continuam como estavam escritos.

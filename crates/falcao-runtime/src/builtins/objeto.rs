@@ -194,6 +194,13 @@ pub(crate) fn objeto_para_descritor(m: &mut Motor, o: Valor) -> Res<DescParcial>
     Ok(d)
 }
 
+impl Motor {
+    /// [`objeto_para_descritor`] para quem está fora de `builtins` (armadilhas de Proxy).
+    pub(crate) fn para_descritor(&mut self, o: Valor) -> Res<DescParcial> {
+        objeto_para_descritor(self, o)
+    }
+}
+
 fn chaves_para_array(m: &mut Motor, ks: Vec<ChaveProp>) -> Valor {
     let vs: Vec<Valor> = ks.into_iter().map(|k| m.chave_para_valor(k)).collect();
     m.array_de(&vs)
@@ -421,7 +428,7 @@ fn from_entries(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> 
 fn get_own_property_descriptor(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     let o = m.para_objeto(m.arg(a, 0))?;
     let k = m.para_chave(m.arg(a, 1))?;
-    Ok(match m.descritor_proprio(o, k) {
+    Ok(match m.descritor_proprio_res(o, k)? {
         Some(d) => descritor_para_objeto(m, d),
         None => Valor::UNDEFINED,
     })
@@ -857,7 +864,7 @@ fn reflect_has(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
 fn reflect_own_keys(m: &mut Motor, _this: Valor, a: Args, _nt: Valor) -> Res<Valor> {
     let o = m.arg(a, 0);
     exigir_objeto(m, o, "Reflect.ownKeys")?;
-    let ks = m.chaves_de(o, false, true, true);
+    let ks = m.chaves_proprias_res(o)?;
     Ok(chaves_para_array(m, ks))
 }
 

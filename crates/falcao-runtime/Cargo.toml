@@ -11,3 +11,4 @@ repository.workspace = true
 [dependencies]
 falcao-sintaxe = { path = "../falcao-sintaxe" }
 falcao-bytecode = { path = "../falcao-bytecode" }
+falcao-asm = { path = "../falcao-asm" }
